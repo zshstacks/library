@@ -5,7 +5,7 @@ import ThemeProvider from "@/components/ThemeProvider";
 export const metadata: Metadata = {
   title: "zshLibrary – Dev Knowledge Base",
   description:
-    "Personal knowledge library covering Unreal Engine, Golang, .NET, React, and TypeScript.",
+    "Personal knowledge library covering Unreal Engine, Golang, .NET, React, TypeScript and more!",
   openGraph: {
     title: "zshLibrary",
     description:

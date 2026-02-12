@@ -56,7 +56,6 @@ function CategoryCard({
             "rgba(255,255,255,0.08)";
         }}
       >
-        {/* Accent glow */}
         <div
           className="absolute inset-0 rounded-xl opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none"
           style={{
@@ -64,7 +63,6 @@ function CategoryCard({
           }}
         />
 
-        {/* Top row: icon + badge */}
         <div className="flex items-start justify-between mb-3">
           <div
             className="p-2 rounded-lg flex items-center justify-center"
@@ -75,18 +73,13 @@ function CategoryCard({
             </span>
           </div>
 
-          {category.articleCount > 0 ? (
+          {category.articleCount > 0 && (
             <span className="text-[11px] font-medium text-white/30 dark:text-gray-700/50 bg-white/5 dark:bg-black/5 px-2 py-0.5 rounded-full border border-white/8 dark:border-gray-800/15">
               {category.articleCount} notes
-            </span>
-          ) : (
-            <span className="text-[11px] font-medium text-white/20 dark:text-gray-700/40 bg-white/4 dark:bg-black/4 px-2 py-0.5 rounded-full border border-white/6 dark:border-gray-800/10">
-              coming soon
             </span>
           )}
         </div>
 
-        {/* Title */}
         <h2
           className="font-semibold text-[14.5px] mb-1.5"
           style={{ color: category.accentColor }}
@@ -94,12 +87,10 @@ function CategoryCard({
           {category.label}
         </h2>
 
-        {/* Description */}
         <p className="text-[12.5px] text-white/50 dark:text-gray-700/55 leading-relaxed mb-4">
           {category.description}
         </p>
 
-        {/* Footer */}
         <div className="flex items-center gap-1 text-[11.5px] text-white/30 dark:text-gray-700/40 group-hover:text-white/65 dark:group-hover:text-gray-700/65 transition-colors">
           <span>Browse notes</span>
           <MdOutlineNavigateNext
@@ -123,7 +114,6 @@ export default function HomePage() {
   return (
     <main className="min-h-screen text-white/80 dark:text-gray-800">
       <div className="max-w-[900px] mx-auto px-4 sm:px-6 pt-[88px] pb-16">
-        {/* Hero */}
         <section
           className="mb-12 transition-all duration-700 ease-out"
           style={{
@@ -131,7 +121,6 @@ export default function HomePage() {
             transform: isVisible ? "translateY(0)" : "translateY(20px)",
           }}
         >
-          {/* Badge */}
           <div className="mb-5">
             <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-white/5 dark:bg-white/40 border border-white/8 dark:border-gray-800/15 backdrop-blur-sm text-[12px] text-white/55 dark:text-gray-700/60">
               <IoBookOutline size={13} className="text-[#81e6d9]" />
@@ -152,7 +141,6 @@ export default function HomePage() {
           <div className="mt-8 w-full border-t border-white/8 dark:border-gray-800/15" />
         </section>
 
-        {/* Grid */}
         <section aria-labelledby="categories-heading">
           <h2
             id="categories-heading"
@@ -176,7 +164,6 @@ export default function HomePage() {
           </div>
         </section>
 
-        {/* Footer note */}
         <div
           className="mt-16 text-center transition-opacity duration-700 delay-500"
           style={{ opacity: isVisible ? 1 : 0 }}

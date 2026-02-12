@@ -1,0 +1,130 @@
+---
+title: REST APIs with Gin
+description: Building production-ready REST APIs with the Gin framework — routing groups, middleware, and consistent error handling.
+tags: [gin, rest, api, middleware]
+readTime: 10
+date: 2025-01-20
+---
+
+## Why Gin
+
+Gin is fast, minimal, and has sensible defaults. The router uses a radix tree,
+so route matching stays O(log n) even with hundreds of routes.
+
+```bash
+go get -u github.com/gin-gonic/gin
+```
+
+## Basic setup
+
+```go
+package main
+
+import "github.com/gin-gonic/gin"
+
+func main() {
+    r := gin.Default() // Logger + Recovery middleware included
+
+    r.GET("/ping", func(c *gin.Context) {
+        c.JSON(200, gin.H{"message": "pong"})
+    })
+
+    r.Run(":8080")
+}
+```
+
+## Routing groups
+
+Group related routes together to share a prefix and middleware.
+
+```go
+api := r.Group("/api/v1")
+{
+    api.GET("/users",     getUsers)
+    api.POST("/users",    createUser)
+    api.GET("/users/:id", getUserByID)
+}
+```
+
+<Callout type="tip">
+    Use `{}` braces inside groups — it's just a Go block scope, but it makes
+    the nesting visually obvious when you have many route groups.
+</Callout>
+
+## Binding request data
+
+Gin can bind JSON, form data, and query params into structs automatically.
+
+```go
+type CreateUserRequest struct {
+    Name  string `json:"name"  binding:"required"`
+    Email string `json:"email" binding:"required,email"`
+}
+
+func createUser(c *gin.Context) {
+    var req CreateUserRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(400, gin.H{"error": err.Error()})
+        return
+    }
+    // req.Name and req.Email are validated
+}
+```
+
+## Middleware
+
+Middleware functions run before (or after) your handler. They're just
+`gin.HandlerFunc` values called via `Use`.
+
+```go
+func AuthMiddleware() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        token := c.GetHeader("Authorization")
+        if token == "" {
+            c.AbortWithStatusJSON(401, gin.H{"error": "unauthorized"})
+            return
+        }
+        // validate token, set user in context...
+        c.Set("userID", 42)
+        c.Next() // call the actual handler
+    }
+}
+
+// Apply to a group
+protected := r.Group("/api/v1", AuthMiddleware())
+```
+
+## Consistent error responses
+
+Define a single error shape and use it everywhere.
+
+```go
+type APIError struct {
+    Code    int    `json:"code"`
+    Message string `json:"message"`
+}
+
+func respondError(c *gin.Context, status int, msg string) {
+    c.AbortWithStatusJSON(status, APIError{Code: status, Message: msg})
+}
+```
+
+<Callout type="warning">
+    Never return raw Go error strings to the client in production — they leak
+    internal implementation details. Always map errors to a controlled message.
+</Callout>
+
+## Project structure
+
+```
+/
+├── cmd/
+│   └── server/main.go
+├── internal/
+│   ├── handler/      ← gin handlers
+│   ├── service/      ← business logic
+│   ├── repository/   ← DB queries
+│   └── middleware/
+└── pkg/
+    └── response/     ← shared response helpers
+```
