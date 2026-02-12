@@ -1,2 +1,143 @@
+@import url("https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap");
 @import "tailwindcss";
 
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+    --breakpoint-xs: 24rem;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+    background-color: #202023;
+    transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+html.dark body {
+    background-color: #f0e7db;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+    width: 6px;
+}
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+::-webkit-scrollbar-thumb {
+    background: rgba(129, 230, 217, 0.3);
+    border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(129, 230, 217, 0.6);
+}
+
+::selection {
+    background: rgba(129, 230, 217, 0.2);
+    color: #81e6d9;
+}
+
+/* Fonts */
+html {
+    font-family: "Geist", sans-serif;
+}
+
+code,
+pre {
+    font-family: "Geist Mono", monospace;
+}
+
+/* Fade-in keyframes */
+@keyframes fadeInUp {
+    from {
+        opacity: 0;
+        transform: translateY(14px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+
+.anim-fade-in-up {
+    animation: fadeInUp 0.5s ease-out forwards;
+}
+.anim-delay-0   { animation-delay: 0ms; }
+.anim-delay-1   { animation-delay: 80ms; }
+.anim-delay-2   { animation-delay: 160ms; }
+.anim-delay-3   { animation-delay: 240ms; }
+.anim-delay-4   { animation-delay: 320ms; }
+.anim-delay-5   { animation-delay: 400ms; }
+
+/* Prose styles */
+.prose-library h2 {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: rgba(255, 255, 255, 0.88);
+    margin: 28px 0 10px;
+}
+.dark .prose-library h2 {
+    color: rgba(31, 41, 55, 0.88);
+}
+
+.prose-library h3 {
+    font-size: 1rem;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.80);
+    margin: 20px 0 8px;
+}
+.dark .prose-library h3 {
+    color: rgba(31, 41, 55, 0.80);
+}
+
+.prose-library p {
+    font-size: 14px;
+    color: rgba(255, 255, 255, 0.65);
+    line-height: 1.78;
+    margin-bottom: 14px;
+}
+.dark .prose-library p {
+    color: rgba(31, 41, 55, 0.70);
+}
+
+.prose-library pre {
+    background: rgba(0, 0, 0, 0.40);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 16px;
+    overflow-x: auto;
+    margin-bottom: 18px;
+}
+.dark .prose-library pre {
+    background: rgba(0, 0, 0, 0.06);
+    border-color: rgba(0, 0, 0, 0.08);
+}
+
+.prose-library code {
+    font-family: "Geist Mono", monospace;
+    font-size: 13px;
+    color: #81e6d9;
+}
+.dark .prose-library code {
+    color: #319795;
+}
+
+.prose-library p code {
+    background: rgba(129, 230, 217, 0.08);
+    border: 1px solid rgba(129, 230, 217, 0.15);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 12.5px;
+}
+.dark .prose-library p code {
+    background: rgba(49, 151, 149, 0.10);
+    border-color: rgba(49, 151, 149, 0.20);
+}
