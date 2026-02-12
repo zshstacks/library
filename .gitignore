@@ -1,4 +1,3 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
 # dependencies
 /node_modules
@@ -17,21 +16,44 @@
 /.next/
 /out/
 
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
 # production
 /build
 
 # misc
 .DS_Store
 *.pem
+/public
+/uploads
 
 # debug
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-.pnpm-debug.log*
 
 # env files (can opt-in for committing if needed)
-.env*
+*.env
+.env
+.env.local
+.env.dev
+.env.prod
+.env.production
+.env.development
+.env.staging
+
+# Docker related files that should be ignored
+docker-compose.override.yml
+.docker/
+
+# SSL certificates and secrets (if you add them later)
+nginx/ssl/
+secrets/
+certs/
 
 # vercel
 .vercel
@@ -39,3 +61,13 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+/certs
+frontend.key
+frontend.crt
+frontend.key~
+frontend.crt~
+
+# Temporary folders
+tmp/
+temp/
