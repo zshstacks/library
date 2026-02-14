@@ -33,7 +33,7 @@ function ArticleRow({
       <div className="row-accent relative flex items-start justify-between gap-4 px-4 py-4 rounded-lg border border-white/[0.06] dark:border-gray-800/12 bg-white/[0.03] dark:bg-white/35 hover:bg-white/[0.06] dark:hover:bg-white/45 hover:border-white/12 dark:hover:border-gray-800/20 transition-all duration-250">
         <div className="flex-1 min-w-0">
           <h3
-            className="font-semibold text-[15px] mb-1"
+            className="font-semibold text-[15px] mb-1 "
             style={{ color: accentColor }}
           >
             {article.title}

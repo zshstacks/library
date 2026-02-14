@@ -1,0 +1,513 @@
+---
+title: Redux Auth Slice in SublimeHub
+description: Managing authentication state with Redux Toolkit — axios instance with HttpOnly cookie credentials, createAsyncThunk for every auth action, a single slice that handles 10 operations, typed state, and clean error handling.
+tags: [react, redux, typescript, nextjs, axios, auth]
+readTime: 11
+date: 2025-05-09
+---
+
+## Structure
+
+The Redux layer sits in `src/redux/` alongside the rest of the client source.
+Three slices cover the whole application — auth, crypto, and monitor.
+
+```
+src/redux/
+├── authSlice/
+│   ├── asyncActions.ts   ← createAsyncThunk for every auth endpoint
+│   └── authSlice.ts      ← slice with reducers + extraReducers
+├── cryptoSlice/
+├── monitorSlice/
+├── api.ts                ← shared axios instance
+└── store.ts              ← configureStore + exported types
+```
+
+## Axios instance
+
+All API calls go through a single axios instance so the base URL and
+credentials config are set in one place:
+
+```ts
+import axios from "axios";
+
+const api = axios.create({
+  baseURL: process.env.NEXT_PUBLIC_API_URL,
+  withCredentials: true,
+});
+
+export default api;
+```
+
+`withCredentials: true` is the critical line. It tells the browser to include
+cookies on every request — including the `HttpOnly` access and refresh tokens
+set by the Go backend. Without it, the browser strips all cookies from
+cross-origin requests regardless of what the server sends back.
+
+<Callout type="warning">
+    `withCredentials: true` only works if the backend's `Access-Control-Allow-Origin`
+    header is an explicit origin (e.g. `http://localhost:3000`), not a wildcard
+    `*`. A wildcard + credentials combination is rejected by the browser with a
+    CORS error.
+</Callout>
+
+## Store
+
+```ts
+import { configureStore } from "@reduxjs/toolkit";
+import authReducer from "./authSlice/authSlice";
+import monitorReducer from "./monitorSlice/monitorSlice";
+import cryptoReducer from "./cryptoSlice/cryptoSlice";
+
+export const store = configureStore({
+  reducer: {
+    auth: authReducer,
+    monitor: monitorReducer,
+    crypto: cryptoReducer,
+  },
+});
+
+export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;
+```
+
+`RootState` and `AppDispatch` are derived directly from the store so they
+stay in sync with the reducer shape automatically — no manual type
+maintenance needed when a new slice is added.
+
+## Types
+
+```ts
+interface UserType {
+  id: number;
+  uniqueID: string;
+  email: string;
+  username: string;
+  createdAt: Date;
+}
+
+export interface AuthState {
+  user: UserType | null;
+  error: string | null;
+  isLoading: boolean;
+}
+```
+
+`AuthState` has three fields. `user: null` means unauthenticated or loading.
+`error: string | null` carries the last failure message for the UI to display.
+`isLoading: true` is the initial value — the app starts in a loading state
+and resolves to authenticated or unauthenticated after `loadUser` settles.
+
+## Async actions
+
+Each backend endpoint gets its own `createAsyncThunk`. They all follow the
+same shape: call the API, return `res.data` on success, call
+`thunkAPI.rejectWithValue` with a plain string on failure.
+
+```ts
+import { createAsyncThunk } from "@reduxjs/toolkit";
+import api from "@/redux/api";
+
+export const registerUser = createAsyncThunk(
+  "auth/registerUser",
+  async (
+    userData: { email: string; password: string; username: string },
+    thunkAPI,
+  ) => {
+    try {
+      const res = await api.post("/register", userData);
+      return res.data;
+    } catch (error) {
+      return thunkAPI.rejectWithValue("Register failed");
+    }
+  },
+);
+
+export const loginUser = createAsyncThunk(
+  "auth/loginUser",
+  async (userData: { email: string; password: string }, thunkAPI) => {
+    try {
+      const res = await api.post("/login", userData);
+      return res.data;
+    } catch (error) {
+      return thunkAPI.rejectWithValue("Login failed");
+    }
+  },
+);
+
+export const loadUser = createAsyncThunk(
+  "auth/loadUser",
+  async (_, thunkAPI) => {
+    try {
+      const res = await api.get("/user/current");
+      return res.data;
+    } catch (error) {
+      return thunkAPI.rejectWithValue("Failed to load user data.");
+    }
+  },
+);
+
+export const logoutUser = createAsyncThunk(
+  "auth/logout",
+  async (_, thunkAPI) => {
+    try {
+      const res = await api.post("/auth/refresh/logout");
+      return res.data;
+    } catch (error) {
+      return thunkAPI.rejectWithValue("Failed to logout");
+    }
+  },
+);
+
+export const verifyEmail = createAsyncThunk(
+  "auth/verifyEmail",
+  async ({ email, code }: { email: string; code: string }, thunkAPI) => {
+    try {
+      const res = await api.post("/auth/verify-email", { email, code });
+      return res.data;
+    } catch (error) {
+      return thunkAPI.rejectWithValue("Failed to verify email");
+    }
+  },
+);
+
+export const resendOtp = createAsyncThunk(
+  "auth/resendOtp",
+  async (email: string, thunkAPI) => {
+    try {
+      const res = await api.post("/auth/resend-otp", { email });
+      return res.data;
+    } catch (error) {
+      return thunkAPI.rejectWithValue("Failed to resend confirmation code");
+    }
+  },
+);
+
+export const forgotPassword = createAsyncThunk(
+  "auth/forgotPassword",
+  async (email: string, thunkAPI) => {
+    try {
+      const res = await api.post("/auth/reset", { email });
+      return res.data;
+    } catch (error) {
+      return thunkAPI.rejectWithValue("Failed to reset password");
+    }
+  },
+);
+
+export const resetPassword = createAsyncThunk(
+  "auth/resetPassword",
+  async (
+    { email, code, new_password }: { email: string; code: string; new_password: string },
+    thunkAPI,
+  ) => {
+    try {
+      const res = await api.post("/auth/reset/new", { email, code, new_password });
+      return res.data;
+    } catch (error) {
+      return thunkAPI.rejectWithValue("Failed to reset password");
+    }
+  },
+);
+
+export const deleteUser = createAsyncThunk(
+  "auth/deleteUser",
+  async (_, thunkAPI) => {
+    try {
+      const res = await api.delete("/user/current/delete");
+      return res.data;
+    } catch (error) {
+      return thunkAPI.rejectWithValue("Failed to delete user");
+    }
+  },
+);
+
+export const changeUsername = createAsyncThunk(
+  "auth/changeUsername",
+  async (username: string, thunkAPI) => {
+    try {
+      const res = await api.put("/user/current/change-username", { username });
+      return res.data;
+    } catch (error) {
+      return thunkAPI.rejectWithValue("Failed to update username");
+    }
+  },
+);
+```
+
+`thunkAPI.rejectWithValue` is what turns a rejected thunk into an
+`action.payload` you can read in `extraReducers` — without it, a rejected
+thunk gives you an `Error` object in `action.error`, not a plain string. Using
+`rejectWithValue` keeps the error type consistent and avoids casting in the
+reducer.
+
+<Callout type="note">
+    All error messages are hardcoded strings rather than forwarding
+    `error.response?.data?.message` from the server. This keeps UI copy
+    controlled by the frontend. To forward server errors instead, replace
+    the catch body with:
+    `return thunkAPI.rejectWithValue((error as AxiosError).response?.data?.message)`
+</Callout>
+
+## Auth slice
+
+```ts
+import { AuthState } from "@/utility/types/reduxTypes";
+import { createSlice } from "@reduxjs/toolkit";
+import {
+  changeUsername, deleteUser, forgotPassword, loadUser,
+  loginUser, logoutUser, registerUser, resendOtp,
+  resetPassword, verifyEmail,
+} from "@/redux/authSlice/asyncActions";
+
+const initialState: AuthState = {
+  isLoading: true,
+  error: null,
+  user: null,
+};
+
+const authSlice = createSlice({
+  name: "auth",
+  initialState,
+  reducers: {
+    clearAuthErrors: (state) => {
+      state.error = null;
+    },
+  },
+  extraReducers: (builder) => {
+    builder
+
+      .addCase(loginUser.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+        state.user = null;
+      })
+      .addCase(loginUser.fulfilled, (state, action) => {
+        state.isLoading = false;
+        state.user = action.payload;
+      })
+      .addCase(loginUser.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+
+      .addCase(registerUser.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+        state.user = null;
+      })
+      .addCase(registerUser.fulfilled, (state, action) => {
+        state.isLoading = false;
+        state.user = action.payload;
+      })
+      .addCase(registerUser.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+
+      .addCase(loadUser.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+        state.user = null;
+      })
+      .addCase(loadUser.fulfilled, (state, action) => {
+        state.isLoading = false;
+        state.user = action.payload;
+      })
+      .addCase(loadUser.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+
+      .addCase(logoutUser.pending, (state) => {
+        state.user = null;
+        state.error = null;
+        state.isLoading = true;
+      })
+      .addCase(logoutUser.fulfilled, (state) => {
+        state.isLoading = false;
+        state.user = null;
+        state.error = null;
+      })
+      .addCase(logoutUser.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+
+      .addCase(verifyEmail.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(verifyEmail.fulfilled, (state, action) => {
+        state.isLoading = false;
+        state.user = action.payload;
+      })
+      .addCase(verifyEmail.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+
+      .addCase(resendOtp.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(resendOtp.fulfilled, (state, action) => {
+        state.isLoading = false;
+        state.user = action.payload;
+      })
+      .addCase(resendOtp.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+
+      .addCase(forgotPassword.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(forgotPassword.fulfilled, (state, action) => {
+        state.isLoading = false;
+        state.user = action.payload;
+      })
+      .addCase(forgotPassword.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+
+      // reset password — clears user on success (backend revokes all sessions)
+      .addCase(resetPassword.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(resetPassword.fulfilled, (state) => {
+        state.isLoading = false;
+        state.user = null;
+        state.error = null;
+      })
+      .addCase(resetPassword.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+
+      // change username — patches only the username field in place
+      .addCase(changeUsername.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(changeUsername.fulfilled, (state, action) => {
+        state.isLoading = false;
+        if (state.user) {
+          state.user.username = action.payload.username;
+        }
+        state.error = null;
+      })
+      .addCase(changeUsername.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+
+      .addCase(deleteUser.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(deleteUser.fulfilled, (state) => {
+        state.isLoading = false;
+        state.user = null;
+        state.error = null;
+      })
+      .addCase(deleteUser.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      });
+  },
+});
+
+export const { clearAuthErrors } = authSlice.actions;
+export default authSlice.reducer;
+```
+
+### Initial state starts loading
+
+```ts
+const initialState: AuthState = {
+  isLoading: true,  // ← not false
+  error: null,
+  user: null,
+};
+```
+
+`isLoading` starts as `true` so the UI knows to show a spinner on mount
+before `loadUser` settles. If it started `false`, the app would briefly
+render the unauthenticated state before the session check returns — causing
+a flash of the login screen for already-authenticated users.
+
+### resetPassword clears user
+
+`resetPassword.fulfilled` sets `state.user = null`. The backend revokes all
+active sessions when a password is reset, so leaving `user` populated in
+the store would be a lie — the session cookies are now invalid. Clearing the
+user forces the app to treat the user as logged out.
+
+### changeUsername patches in place
+
+```ts
+.addCase(changeUsername.fulfilled, (state, action) => {
+  if (state.user) {
+    state.user.username = action.payload.username;
+  }
+})
+```
+
+Only `username` is updated rather than replacing the entire `user` object.
+This avoids triggering re-renders in components that read other user fields
+and means a full `loadUser` refetch isn't needed.
+
+### clearAuthErrors
+
+```ts
+reducers: {
+  clearAuthErrors: (state) => {
+    state.error = null;
+  },
+},
+```
+
+A synchronous reducer for dismissing error banners when the user navigates
+away from a form or starts typing again — without touching `user` or
+`isLoading`.
+
+## Using in components
+
+```tsx
+import { useDispatch, useSelector } from "react-redux";
+import { AppDispatch, RootState } from "@/redux/store";
+import { loginUser, clearAuthErrors } from "@/redux/authSlice";
+
+const dispatch: AppDispatch = useDispatch();
+const { user, isLoading, error } = useSelector((state: RootState) => state.auth);
+
+// dispatch a thunk
+dispatch(loginUser({ email, password }));
+
+// clear errors when user starts typing
+dispatch(clearAuthErrors());
+```
+
+`AppDispatch` from the store gives the typed dispatch that accepts thunks.
+Using the plain `Dispatch` type from React-Redux would reject thunk arguments
+— always use the store-derived type for async dispatches.
+
+## Action-to-endpoint map
+
+```
+| Thunk | Method | Endpoint |
+|-------|--------|----------|
+| `registerUser` | `POST` | `/register` |
+| `loginUser` | `POST` | `/login` |
+| `loadUser` | `GET` | `/user/current` |
+| `logoutUser` | `POST` | `/auth/refresh/logout` |
+| `verifyEmail` | `POST` | `/auth/verify-email` |
+| `resendOtp` | `POST` | `/auth/resend-otp` |
+| `forgotPassword` | `POST` | `/auth/reset` |
+| `resetPassword` | `POST` | `/auth/reset/new` |
+| `changeUsername` | `PUT` | `/user/current/change-username` |
+| `deleteUser` | `DELETE` | `/user/current/delete` |
+```

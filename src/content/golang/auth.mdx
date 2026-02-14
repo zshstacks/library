@@ -1,0 +1,785 @@
+---
+title: JWT Cookie Auth, Refresh Token Rotation & Google OAuth in Go
+description: The full SublimeHub authentication system — HttpOnly cookie strategy, JWT signing and verification, automatic refresh token rotation in middleware, Google OAuth with CSRF state protection, transaction-safe account deletion, and all the helper utilities.
+tags: [golang, echo, gorm, jwt, oauth, auth, postgresql]
+readTime: 18
+date: 2025-05-14
+---
+
+## Architecture overview
+
+Authentication is split into two token types delivered as `HttpOnly` cookies:
+
+- **Access token** — short-lived JWT (15 minutes), verified on every protected request
+- **Refresh token** — long-lived opaque token (7 days), rotated on every use
+
+Neither token is ever accessible to JavaScript. The frontend relies entirely
+on cookie-based credential flow with `withCredentials: true` on axios.
+
+## Models
+
+### User
+
+```go
+const (
+    AuthProviderLocal  string = "local"
+    AuthProviderGoogle string = "google"
+)
+
+type User struct {
+    gorm.Model
+    UniqueID                   string `gorm:"uniqueIndex;size:12;not null" json:"uniqueID"`
+    Email                      string `gorm:"uniqueIndex;size:40;not null" json:"email"`
+    Username                   string `gorm:"size:30" json:"username"`
+    Password                   string `json:"-"`
+    OAuthProvider              string `gorm:"default:'local'"`
+    OAuthProviderID            string `gorm:"index"`
+    IsEmailConfirmed           bool   `gorm:"default:false"`
+    EmailConfirmationCode      string `gorm:"size:64" json:"-"`
+    ConfirmationCodeExpiresAt  time.Time
+    PasswordResetCode          string `gorm:"size:64" json:"-"`
+    PasswordResetCodeExpiresAt time.Time
+
+    Favorites []models.Coin `gorm:"many2many:user_favorites;" json:"favorites"`
+}
+```
+
+### RefreshToken
+
+```go
+type RefreshToken struct {
+    ID         uint       `gorm:"primaryKey"`
+    TokenId    string     `gorm:"size:36;uniqueIndex;not null"`
+    TokenHash  string     `gorm:"size:64;index;not null"`
+    UserID     uint       `gorm:"index;not null"`
+    IssuedAt   time.Time  `gorm:"not null"`
+    ExpiresAt  time.Time  `gorm:"not null"`
+    RevokedAt  *time.Time `gorm:"index;default:null"`
+    ReplacedBy *string    `gorm:"size:36;index;default:null"`
+    Device     *string    `gorm:"size:255;default:null"`
+    IP         *string    `gorm:"size:45;default:null"`
+    UserAgent  *string    `gorm:"type:text;default:null"`
+    LastUsedAt *time.Time `gorm:"index;default:null"`
+
+    User User `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE;"`
+}
+```
+
+The refresh token stored in the DB is never the raw value the browser holds —
+only its SHA-256 hash is persisted in `TokenHash`. What the browser holds in
+the `refresh_token` cookie is `tokenID + "." + secret`. On refresh, the
+server splits this, looks up by `tokenID`, then hashes the `secret` and
+compares to `TokenHash`.
+
+`ReplacedBy` stores the `tokenID` of the next token issued in a rotation
+chain — useful for detecting token reuse attacks: if an old revoked token
+is presented again, `ReplacedBy` shows which token was minted from it.
+
+<Callout type="note">
+    `RevokedAt *time.Time` and `ReplacedBy *string` use pointer types so GORM
+    can represent the null state (`nil`) distinctly from a zero value. A
+    non-nil `RevokedAt` means the token was explicitly revoked; `nil` means it
+    is still valid.
+</Callout>
+
+## Config and environment
+
+```bash
+JWT_SECRET=your_jwt_secret
+JWT_ACCESS_TTL=15      # minutes
+JWT_REFRESH_TTL=7      # days
+
+GOOGLE_CLIENT_ID=your_google_client_id
+GOOGLE_CLIENT_SECRET=your_google_client_secret
+```
+
+`AppConfig` reads these at startup. All JWT and cookie settings are read from
+config rather than hardcoded, so TTLs can be changed per environment.
+
+## Helper utilities
+
+### FindUserByEmail
+
+```go
+func FindUserByEmail(db *gorm.DB, email string) (models.User, error) {
+    var user models.User
+    if err := db.First(&user, "email = ?", email).Error; err != nil {
+       return user, err
+    }
+    return user, nil
+}
+```
+
+A shared lookup used across register, login, OTP verify, and password reset.
+Returns the GORM error so callers can distinguish `ErrRecordNotFound` from
+other failures.
+
+### GenerateUniqueID
+
+```go
+const base62Alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+func GenerateUniqueID(length int) (string, error) {
+    if length <= 0 {
+       return "", errors.New("length must be > 0")
+    }
+    bitsNeeded := float64(length) * math.Log2(62.0)
+    bytesNeeded := int(math.Ceil(bitsNeeded / 8.0))
+
+    randomBytes := make([]byte, bytesNeeded)
+    if _, err := rand.Read(randomBytes); err != nil {
+       return "", err
+    }
+
+    n := big.NewInt(0).SetBytes(randomBytes)
+    alphabet := base62Alphabet
+    base := big.NewInt(int64(len(alphabet)))
+    chars := make([]byte, 0, length)
+
+    zero := big.NewInt(0)
+    for len(chars) < length {
+       if n.Cmp(zero) == 0 {
+          if _, err := rand.Read(randomBytes); err != nil {
+             return "", err
+          }
+          n.SetBytes(randomBytes)
+       }
+       mod := big.NewInt(0)
+       n.DivMod(n, base, mod)
+       chars = append(chars, alphabet[mod.Int64()])
+    }
+
+    for i, j := 0, len(chars)-1; i < j; i, j = i+1, j-1 {
+       chars[i], chars[j] = chars[j], chars[i]
+    }
+    return string(chars), nil
+}
+```
+
+Generates a cryptographically secure base62 string of arbitrary length.
+`math.Log2(62.0)` gives the bits of entropy per character — multiplied by
+`length` then converted to bytes to determine how many random bytes to read.
+The big.Int division loop extracts one base62 digit per iteration. The result
+is reversed at the end because `DivMod` produces digits least-significant first.
+
+### GenerateRandomString
+
+```go
+func GenerateRandomString(n int) string {
+    b := make([]byte, n)
+    if _, err := rand.Read(b); err != nil {
+       return ""
+    }
+    return hex.EncodeToString(b)
+}
+```
+
+Used for the OAuth CSRF state. `n` bytes from `crypto/rand` hex-encoded
+produces a `2n`-character string — calling `GenerateRandomString(16)` gives
+a 32-character hex state value.
+
+## JWT helpers
+
+### SignJWT
+
+```go
+type JWTClaims struct {
+    Sub uint   `json:"sub"`
+    UID string `json:"uid"`
+    jwt.RegisteredClaims
+}
+
+func SignJWT(cfg infrastructure.AppConfig, user models.User) (string, error) {
+    claims := JWTClaims{
+       Sub: user.ID,
+       UID: user.UniqueID,
+       RegisteredClaims: jwt.RegisteredClaims{
+          IssuedAt: jwt.NewNumericDate(time.Now()),
+          ExpiresAt: jwt.NewNumericDate(
+             time.Now().Add(time.Duration(cfg.JWT.AccessTokenTTL) * time.Minute),
+          ),
+       },
+    }
+
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    secret := []byte(cfg.JWT.Secret)
+
+    return token.SignedString(secret)
+}
+```
+
+The JWT payload carries `Sub` (the DB primary key, for fast lookups) and
+`UID` (the public-facing `UniqueID`, for use in responses). `HS256` with
+a symmetric secret is fine here since only the backend signs and verifies.
+
+### VerifyAccessToken
+
+```go
+func VerifyAccessToken(tokenStr string, cfg infrastructure.AppConfig) (*JWTClaims, error) {
+    token, err := jwt.ParseWithClaims(tokenStr, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
+       if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+          return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+       }
+       return []byte(cfg.JWT.Secret), nil
+    })
+
+    if err != nil {
+       return nil, err
+    }
+
+    claims, ok := token.Claims.(*JWTClaims)
+    if !ok || !token.Valid {
+       return nil, fmt.Errorf("invalid token")
+    }
+
+    return claims, nil
+}
+```
+
+The key function in `ParseWithClaims` explicitly checks the signing method
+before returning the secret. Without this check, an attacker could set the
+`alg` header to `"none"` and submit an unsigned token — the library would
+call the key function with `*jwt.SigningMethodNone` and receive the secret,
+potentially accepting the forged token.
+
+## finalizeSession — shared session creation
+
+Login, OAuth callback, and token refresh all converge on this method:
+
+```go
+func (ac *AuthController) finalizeSession(c echo.Context, user models.User) error {
+
+    accessToken, err := helpers.SignJWT(ac.Cfg, user)
+    if err != nil {
+       return echo.NewHTTPError(http.StatusInternalServerError, "Failed to create access token")
+    }
+
+    c.SetCookie(&http.Cookie{
+       Name:     "token",
+       Value:    accessToken,
+       Path:     "/",
+       MaxAge:   ac.Cfg.JWT.AccessTokenTTL * 60,
+       HttpOnly: true,
+       Secure:   ac.Cfg.Cookie.Secure,
+       SameSite: ac.Cfg.Cookie.SameSite,
+    })
+
+    tokenID := uuid.NewString()
+    secret := uuid.NewString()
+    hash := sha256.Sum256([]byte(secret))
+
+    refresh := models.RefreshToken{
+       TokenId:   tokenID,
+       TokenHash: hex.EncodeToString(hash[:]),
+       UserID:    user.ID,
+       IssuedAt:  time.Now(),
+       ExpiresAt: time.Now().Add(time.Duration(ac.Cfg.JWT.RefreshTokenTTL) * 24 * time.Hour),
+    }
+
+    if err := ac.DB.Create(&refresh).Error; err != nil {
+       return echo.NewHTTPError(http.StatusInternalServerError, "Failed to create refresh token")
+    }
+
+    c.SetCookie(&http.Cookie{
+       Name:     "refresh_token",
+       Value:    tokenID + "." + secret,
+       Path:     "/",
+       MaxAge:   ac.Cfg.JWT.RefreshTokenTTL * 24 * 60 * 60,
+       HttpOnly: true,
+       Secure:   ac.Cfg.Cookie.Secure,
+       SameSite: ac.Cfg.Cookie.SameSite,
+    })
+
+    // OAuth Redirect
+    if strings.HasPrefix(c.Path(), "/auth/oauth") {
+       return c.Redirect(http.StatusSeeOther, "http://localhost:3000/hub")
+    }
+
+    return c.JSON(http.StatusOK, struct {
+       ID       uint   `json:"id"`
+       UniqueID string `json:"unique_id"`
+       Email    string `json:"email"`
+       Username string `json:"username"`
+    }{
+       ID:       user.ID,
+       UniqueID: user.UniqueID,
+       Email:    user.Email,
+       Username: user.Username,
+    })
+}
+```
+
+The `tokenID` and `secret` are both random UUIDs. Only `sha256(secret)` is
+stored in the DB — the raw `secret` never persists. The cookie value is
+`tokenID + "." + secret`, which the server splits on first `.` when verifying.
+This means even a full database dump cannot be used to forge refresh tokens.
+
+`MaxAge` is set in seconds: `AccessTokenTTL * 60` converts minutes to seconds
+for the access token; `RefreshTokenTTL * 24 * 60 * 60` converts days to
+seconds for the refresh token.
+
+The OAuth path check at the end routes the callback to a browser redirect
+(`303 See Other`) rather than a JSON response — the browser follows it to
+`/hub`. Non-OAuth calls (regular login) return the user data as JSON.
+
+<Callout type="tip">
+    The browser follows a `303 See Other` redirect even when the original
+    request was `POST` or `GET` — and resets the method to `GET` on the
+    redirect. This is exactly what's needed after an OAuth callback: the
+    browser POSTed the code to the callback, gets a 303, then GETs `/hub`.
+</Callout>
+
+## Login
+
+```go
+func (ac *AuthController) Login(c echo.Context) error {
+    var body struct {
+       Email    string `json:"email"`
+       Password string `json:"password"`
+    }
+
+    if err := c.Bind(&body); err != nil {
+       return echo.NewHTTPError(http.StatusBadRequest, "Failed to read body")
+    }
+
+    user, err := helpers.FindUserByEmail(ac.DB, body.Email)
+    if err != nil || user.ID == 0 {
+       return echo.NewHTTPError(http.StatusBadRequest, "Invalid email or password")
+    }
+
+    if user.IsEmailConfirmed == false {
+       return echo.NewHTTPError(http.StatusForbidden, "Your email is not confirmed")
+    }
+
+    if user.OAuthProvider != models.AuthProviderLocal {
+       return echo.NewHTTPError(http.StatusBadRequest, "Please use social login for this account")
+    }
+
+    if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(body.Password)); err != nil {
+       return echo.NewHTTPError(http.StatusBadRequest, "Invalid email or password")
+    }
+
+    return ac.finalizeSession(c, user)
+}
+```
+
+Three guards before the password check: email must exist (same error message
+as wrong password to prevent user enumeration), email must be confirmed, and
+the account must be a local account. The last guard prevents a Google-linked
+account from logging in with a password — if the user registered via Google,
+there is no password in the DB anyway.
+
+## TryRefresh — token rotation
+
+```go
+func TryRefresh(c echo.Context, db *gorm.DB, cfg infrastructure.AppConfig) (*JWTClaims, error) {
+
+    cookie, err := c.Cookie("refresh_token")
+    if err != nil {
+       return nil, echo.NewHTTPError(http.StatusUnauthorized, "Refresh token missing")
+    }
+
+    parts := strings.SplitN(cookie.Value, ".", 2)
+    if len(parts) != 2 {
+       return nil, echo.NewHTTPError(http.StatusUnauthorized, "Invalid refresh token format")
+    }
+
+    tokenID := parts[0]
+    secret := parts[1]
+
+    var refresh models.RefreshToken
+    result := db.Preload("User").First(&refresh, "token_id = ?", tokenID)
+    if result.Error != nil {
+       return nil, echo.NewHTTPError(http.StatusUnauthorized, "Refresh token not found")
+    }
+
+    hash := sha256.Sum256([]byte(secret))
+    hashStr := hex.EncodeToString(hash[:])
+
+    if hashStr != refresh.TokenHash {
+       return nil, echo.NewHTTPError(http.StatusUnauthorized, "Invalid refresh token")
+    }
+
+    if time.Now().After(refresh.ExpiresAt) || refresh.RevokedAt != nil {
+       return nil, echo.NewHTTPError(http.StatusUnauthorized, "Refresh token is expired or revoked")
+    }
+
+    user := refresh.User
+
+    newTokenID := uuid.NewString()
+    newSecret := uuid.NewString()
+    newHash := sha256.Sum256([]byte(newSecret))
+    newHashStr := hex.EncodeToString(newHash[:])
+
+    newRefresh := models.RefreshToken{
+       TokenId:   newTokenID,
+       TokenHash: newHashStr,
+       UserID:    user.ID,
+       IssuedAt:  time.Now(),
+       ExpiresAt: time.Now().Add(time.Duration(cfg.JWT.RefreshTokenTTL) * 24 * time.Hour),
+    }
+
+    if err := db.Create(&newRefresh).Error; err != nil {
+       return nil, echo.NewHTTPError(http.StatusInternalServerError, "Failed to create a new refresh token")
+    }
+
+    now := time.Now()
+    refresh.RevokedAt = &now
+    refresh.ReplacedBy = &newTokenID
+    db.Save(&refresh)
+
+    accessToken, err := SignJWT(cfg, user)
+    if err != nil {
+       return nil, echo.NewHTTPError(http.StatusInternalServerError, "Failed to create access token")
+    }
+
+    c.SetCookie(&http.Cookie{
+       Name:     "token",
+       Value:    accessToken,
+       Path:     "/",
+       MaxAge:   cfg.JWT.AccessTokenTTL * 60,
+       HttpOnly: true,
+       Secure:   cfg.Cookie.Secure,
+       SameSite: cfg.Cookie.SameSite,
+    })
+
+    c.SetCookie(&http.Cookie{
+       Name:     "refresh_token",
+       Value:    newTokenID + "." + newSecret,
+       Path:     "/",
+       MaxAge:   cfg.JWT.RefreshTokenTTL * 24 * 60 * 60,
+       HttpOnly: true,
+       Secure:   cfg.Cookie.Secure,
+       SameSite: cfg.Cookie.SameSite,
+    })
+
+    claims := &JWTClaims{
+       Sub: user.ID,
+       UID: user.UniqueID,
+       RegisteredClaims: jwt.RegisteredClaims{
+          IssuedAt:  jwt.NewNumericDate(time.Now()),
+          ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(cfg.JWT.AccessTokenTTL) * time.Minute)),
+       },
+    }
+
+    return claims, nil
+}
+```
+
+Every successful refresh issues a new token pair and revokes the old one.
+`ReplacedBy` on the old record links to the new `tokenID` — the audit trail
+of rotations is preserved in the DB. The function returns freshly-constructed
+`*JWTClaims` so the middleware can immediately set `c.Set("user", ...)` using
+the new claims without an extra DB query.
+
+<Callout type="warning">
+    The hash comparison (`hashStr != refresh.TokenHash`) must happen before the
+    expiry/revocation check. If the hash doesn't match, returning `"expired or
+    revoked"` would leak information about token existence. Always fail fast
+    with a generic error on hash mismatch.
+</Callout>
+
+## RequireAuth middleware
+
+```go
+func RequireAuth(db *gorm.DB, cfg infrastructure.AppConfig) echo.MiddlewareFunc {
+    return func(next echo.HandlerFunc) echo.HandlerFunc {
+       return func(c echo.Context) error {
+
+          tokenStr, err := getAccessTokenFromRequest(c)
+          if err != nil {
+             return err
+          }
+
+          claims, err := helpers.VerifyAccessToken(tokenStr, cfg)
+          if err != nil {
+             if errors.Is(err, jwt.ErrTokenExpired) {
+
+                claims, err = helpers.TryRefresh(c, db, cfg)
+                if err != nil {
+                   return err
+                }
+             } else {
+                return echo.NewHTTPError(http.StatusUnauthorized, "Invalid token")
+             }
+          }
+
+          user := models.User{}
+
+          db.First(&user, claims.Sub)
+          if user.ID == 0 {
+             return echo.NewHTTPError(http.StatusUnauthorized, "User not found")
+          }
+
+          c.Set("user", user)
+          return next(c)
+       }
+    }
+}
+```
+
+`errors.Is(err, jwt.ErrTokenExpired)` is the key branch. An expired access
+token is not a failure — it's a normal event expected every 15 minutes. When
+detected, the middleware silently calls `TryRefresh`, which rotates the
+refresh token and issues new cookies. From the user's perspective the session
+just continues; they never have to re-login unless the refresh token itself
+expires or is revoked.
+
+Any error other than expiry (invalid signature, wrong algorithm, malformed
+token) is an actual `401`.
+
+After successful verification, the full user row is fetched from the DB using
+`claims.Sub` (the user's primary key). Setting the full `models.User` on the
+context means every handler gets the live DB record — not just the JWT payload.
+
+## Google OAuth
+
+### Step 1 — redirect to Google
+
+```go
+func (ac *AuthController) GoogleLogin(c echo.Context) error {
+    config := ac.Cfg.GetGoogleConfig()
+    state := helpers.GenerateRandomString(16)
+
+    c.SetCookie(&http.Cookie{
+       Name:     "oauth_state",
+       Value:    state,
+       Path:     "/",
+       MaxAge:   900,
+       HttpOnly: true,
+       Secure:   ac.Cfg.Cookie.Secure,
+       SameSite: ac.Cfg.Cookie.SameSite,
+    })
+
+    url := config.AuthCodeURL(state)
+    return c.Redirect(http.StatusTemporaryRedirect, url)
+}
+```
+
+A random 32-character hex string is generated and stored in an `oauth_state`
+cookie with a 15-minute TTL. The same value is embedded in the Google
+redirect URL via `AuthCodeURL(state)`. Google echoes it back in the callback.
+
+### Step 2 — handle the callback
+
+```go
+func (ac *AuthController) GoogleCallback(c echo.Context) error {
+    stateFromGoogle := c.QueryParam("state")
+    stateCookie, err := c.Cookie("oauth_state")
+    if err != nil || stateFromGoogle != stateCookie.Value {
+       return echo.NewHTTPError(http.StatusBadRequest, "Invalid OAuth state")
+    }
+
+    c.SetCookie(&http.Cookie{Name: "oauth_state", Value: "", Path: "/", MaxAge: -1})
+
+    code := c.QueryParam("code")
+    config := ac.Cfg.GetGoogleConfig()
+    tok, err := config.Exchange(context.Background(), code)
+    if err != nil {
+       return echo.NewHTTPError(http.StatusUnauthorized, "Exchange failed")
+    }
+
+    client := config.Client(context.Background(), tok)
+    resp, err := client.Get("https://www.googleapis.com/oauth2/v3/userinfo")
+    if err != nil {
+       return echo.NewHTTPError(http.StatusBadRequest, "Failed to get user info")
+    }
+    defer resp.Body.Close()
+
+    var gUser struct {
+       Sub   string `json:"sub"`
+       Email string `json:"email"`
+       Name  string `json:"name"`
+    }
+    json.NewDecoder(resp.Body).Decode(&gUser)
+
+    var user models.User
+    err = ac.DB.Where("o_auth_provider_id = ? AND o_auth_provider = ?", gUser.Sub, models.AuthProviderGoogle).First(&user).Error
+
+    if err != nil {
+       var existing models.User
+       if err := ac.DB.Where("email = ?", gUser.Email).First(&existing).Error; err == nil {
+          if existing.OAuthProvider == models.AuthProviderLocal {
+             return c.JSON(http.StatusConflict, map[string]string{
+                "error": "account_exists_with_password",
+             })
+          }
+       }
+
+       uID, _ := helpers.GenerateUniqueID(12)
+       user = models.User{
+          UniqueID:         uID,
+          Email:            gUser.Email,
+          Username:         gUser.Name,
+          OAuthProvider:    models.AuthProviderGoogle,
+          OAuthProviderID:  gUser.Sub,
+          IsEmailConfirmed: true,
+       }
+       ac.DB.Create(&user)
+    }
+
+    return ac.finalizeSession(c, user)
+}
+```
+
+The state comparison is the CSRF guard — if the value Google echoes back
+doesn't match the cookie, the request is rejected. The cookie is immediately
+deleted after the check (`MaxAge: -1`) so it can only be used once.
+
+After exchanging the code for a token, the server fetches the user's profile
+from Google's userinfo endpoint. The lookup then goes:
+
+1. Find existing Google account by `(OAuthProviderID, OAuthProvider)` — returning user
+2. If not found, check if the email exists as a **local** account — returns a
+`409 Conflict` with `"account_exists_with_password"` so the frontend can
+prompt the user to log in with their password instead
+3. If neither match — create a new Google-linked user with `IsEmailConfirmed: true`
+(Google already verified the email)
+
+Google OAuth users have no `Password` field set and `OAuthProvider = "google"`.
+The `Login` handler's `OAuthProvider != AuthProviderLocal` guard prevents
+someone from guessing a password for a Google account that has none.
+
+## Logout
+
+```go
+func (ac *AuthController) Logout(c echo.Context) error {
+    cookie, err := c.Cookie("refresh_token")
+    if err != nil {
+       return echo.NewHTTPError(http.StatusUnauthorized, "Refresh token missing")
+    }
+
+    parts := strings.SplitN(cookie.Value, ".", 2)
+    tokenID := parts[0]
+
+    var refresh models.RefreshToken
+    ac.DB.First(&refresh, "token_id = ?", tokenID)
+    now := time.Now()
+    refresh.RevokedAt = &now
+    ac.DB.Save(&refresh)
+
+    c.SetCookie(&http.Cookie{Name: "refresh_token", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: ac.Cfg.Cookie.Secure, SameSite: ac.Cfg.Cookie.SameSite})
+    c.SetCookie(&http.Cookie{Name: "token", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: ac.Cfg.Cookie.Secure, SameSite: ac.Cfg.Cookie.SameSite})
+
+    return c.JSON(http.StatusOK, map[string]string{"message": "Logged out"})
+}
+```
+
+Logout revokes the current refresh token in the DB and clears both cookies
+by setting `MaxAge: -1`. Even if the access token hasn't expired yet, the
+15-minute window is the maximum time it remains usable after logout — there
+is no access token revocation list by design.
+
+## DeleteUser — transaction
+
+```go
+func (ac *AuthController) DeleteUser(c echo.Context) error {
+    user := c.Get("user")
+    userModel, ok := user.(models.User)
+    if !ok {
+       return echo.NewHTTPError(http.StatusInternalServerError, "Failed to retrieve user")
+    }
+
+    tx := ac.DB.Begin()
+    defer func() {
+       if r := recover(); r != nil {
+          tx.Rollback()
+       }
+    }()
+
+    if err := tx.Unscoped().Where("user_id = ?", userModel.ID).Delete(&models.RefreshToken{}).Error; err != nil {
+       tx.Rollback()
+       return echo.NewHTTPError(http.StatusInternalServerError, "Failed to delete user tokens")
+    }
+
+    if err := tx.Unscoped().Delete(&userModel).Error; err != nil {
+       tx.Rollback()
+       return echo.NewHTTPError(http.StatusInternalServerError, "Failed to delete user")
+    }
+
+    if err := tx.Commit().Error; err != nil {
+       return echo.NewHTTPError(http.StatusInternalServerError, "Failed to complete deletion")
+    }
+
+    c.SetCookie(&http.Cookie{Name: "refresh_token", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: ac.Cfg.Cookie.Secure, SameSite: ac.Cfg.Cookie.SameSite})
+    c.SetCookie(&http.Cookie{Name: "token", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: ac.Cfg.Cookie.Secure, SameSite: ac.Cfg.Cookie.SameSite})
+
+    return c.JSON(http.StatusOK, map[string]string{"message": "User permanently deleted"})
+}
+```
+
+`Unscoped()` bypasses GORM's soft delete so rows are physically removed.
+Both deletes happen inside a transaction — if the user deletion fails, the
+tokens are not left dangling in the DB. The `defer` with `recover()` catches
+any panic and rolls back, preventing a half-committed transaction from leaving
+orphaned data.
+
+The `RefreshToken` table has `OnDelete:CASCADE` on its `User` foreign key, so
+the explicit token deletion inside the transaction is technically redundant —
+but it's safer to be explicit than to rely on the database cascade.
+
+## Routes
+
+```go
+func RegisterRoutes(e *echo.Echo, db *gorm.DB, cfg infrastructure.AppConfig) {
+
+    authController := controllers.NewAuthController(db, cfg)
+
+    public := e.Group("/")
+    {
+       public.POST("register", authController.Register)
+       public.POST("login", authController.Login)
+       public.POST("auth/refresh", authController.Refresh)
+       public.POST("auth/refresh/logout", authController.Logout)
+       public.POST("auth/verify-email", authController.VerifyEmail)
+       public.POST("auth/resend-otp", authController.ResendOTP)
+       public.POST("auth/reset", authController.ForgotPassword)
+       public.POST("auth/reset/new", authController.ResetPassword)
+       public.GET("auth/google", authController.GoogleLogin)
+       public.GET("auth/oauth/google", authController.GoogleCallback)
+    }
+
+    private := e.Group("/user")
+    private.Use(middleware.RequireAuth(db, cfg))
+    {
+       private.GET("/current", authController.GetCurrentUser)
+       private.DELETE("/current/delete", authController.DeleteUser)
+       private.PUT("/current/change-username", authController.ChangeUsername)
+    }
+}
+```
+
+All auth endpoints are public. The `/user` group applies `RequireAuth` as a
+group-level middleware — every route under it is protected without repeating
+the middleware call per route.
+
+## Full auth flow diagram
+
+```
+Registration
+  POST /register → hash password → create user → send OTP email
+  POST /auth/verify-email → check code + expiry → set IsEmailConfirmed = true
+
+Login
+  POST /login → find user → check confirmed → check local provider → verify bcrypt
+    → finalizeSession → set token cookie (15m) + refresh_token cookie (7d)
+
+Protected request
+  GET /user/current
+    → RequireAuth reads "token" cookie
+    → VerifyAccessToken:
+        valid   → set user in context → next()
+        expired → TryRefresh → rotate refresh token → reissue both cookies → next()
+        invalid → 401
+
+Explicit refresh
+  POST /auth/refresh → TryRefresh → rotate + reissue cookies
+
+Logout
+  POST /auth/refresh/logout → revoke refresh token → clear both cookies
+
+Google OAuth
+  GET /auth/google → set oauth_state cookie → redirect to Google
+  GET /auth/oauth/google → verify state → exchange code → fetch profile
+    → find or create user → finalizeSession → redirect to /hub
+```

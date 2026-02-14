@@ -30,7 +30,6 @@ pids
 # misc
 .DS_Store
 *.pem
-/public
 /uploads
 
 # debug

@@ -41,14 +41,4 @@ export const CATEGORIES: CategoryMeta[] = [
     articleCount: 0,
     lastUpdated: "2025-01-01",
   },
-  {
-    slug: "typescript",
-    label: "TypeScript",
-    description:
-      "Type utilities, generics, conditional types, declaration files, and making TypeScript work for you.",
-    icon: "SiTypescript",
-    accentColor: "#fbbf24",
-    articleCount: 0,
-    lastUpdated: "2025-01-01",
-  },
 ];

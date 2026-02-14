@@ -45,7 +45,6 @@ const Header = memo<HeaderProps>(({ theme, setTheme }) => {
     { href: "/golang", label: "Golang" },
     { href: "/dotnet", label: ".NET" },
     { href: "/react", label: "React" },
-    { href: "/typescript", label: "TypeScript" },
   ];
 
   return (
@@ -97,7 +96,7 @@ const Header = memo<HeaderProps>(({ theme, setTheme }) => {
             <div className="flex gap-2 items-center">
               <div className="hidden md:flex gap-2 items-center">
                 <a
-                  href="https://github.com/zshstacks"
+                  href="https://github.com/zshstacks/library"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="hover:underline hover:underline-offset-4 flex gap-1 items-center text-[13px] transition-opacity hover:opacity-80 text-white/50 dark:text-gray-800/50 px-2"

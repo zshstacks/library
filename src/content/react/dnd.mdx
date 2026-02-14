@@ -1,0 +1,431 @@
+---
+title: Draggable Constrained Widgets with dnd-kit
+description: Building draggable, screen-constrained, resizable widgets in React — persistent positions via localStorage, per-widget bounding box modifiers, z-index focus management, and lazy-loaded Suspense boundaries.
+tags: [react, typescript, dnd-kit, nextjs, workspace, ui]
+readTime: 14
+date: 2025-05-05
+---
+
+## Preview
+
+<Screenshot src="/react/dnd_preview.png"  alt="Drag and Drop preview"
+            caption="Drag and Drop preview"/>
+
+## Overview
+
+The workspace has five independently draggable widgets — Pomodoro timer, Todo,
+Paint, Media Player, and Calculator. Each one:
+
+- Can be dragged anywhere on screen but is hard-clamped to a bounding box so
+it can never go offscreen
+- Persists its last position to `localStorage` so it survives page reloads
+- Has its own `DndContext` so drags don't interfere with each other
+- Is lazy-loaded behind a `Suspense` boundary to keep the initial bundle small
+- Brings itself to the front (`z-index: 100`) when clicked
+
+## Library
+
+```bash
+npm install @dnd-kit/core @dnd-kit/modifiers @dnd-kit/sortable @dnd-kit/utilities
+```
+
+The workspace uses `@dnd-kit/core` for drag primitives and `@dnd-kit/modifiers`
+as the extension point for the bounding box clamp. The `modifiers` prop on
+`DndContext` intercepts every transform before it's applied, which is where
+the screen restriction logic lives.
+
+## Types
+
+```ts
+interface WidgetInfo {
+  xPos: number;
+  yPos: number;
+}
+
+interface SavedWidgetLayoutInfo {
+  TimerWidget?: WidgetInfo;
+  TodoWidget?: WidgetInfo;
+  PaintWidget?: WidgetInfo;
+  MediaWidget?: WidgetInfo;
+  CalculatorWidget?: WidgetInfo;
+}
+```
+
+All widget positions are stored under a single `SavedWidgetLayoutInfo` object
+keyed by widget name. The whole object is JSON-serialised into one
+`localStorage` entry so a single read on mount hydrates all positions at once.
+
+## Bounding box modifier
+
+This is the core of the screen restriction system. Each widget has its own
+modifier factory so the clamping area can account for that widget's specific
+dimensions and its reserved screen edges.
+
+```ts
+import { Modifier } from "@dnd-kit/core";
+
+export const restrictToTodoBoundingBox =
+  (dimensions: { width: number; height: number }): Modifier =>
+  ({ transform, activeNodeRect, containerNodeRect }) => {
+    if (!activeNodeRect || !containerNodeRect) {
+      return transform;
+    }
+
+    //restrictions where we can move todo
+    const boundingBox = {
+      top: 58,
+      bottom: window.innerHeight + 8,
+      left: 90,
+      right: window.innerWidth + 89,
+    };
+
+    let newX = transform.x;
+    let newY = transform.y;
+
+    //calculate pos, considering the transformation
+    const adjustedX = activeNodeRect.left + transform.x;
+    const adjustedY = activeNodeRect.top + transform.y;
+
+    //x pos
+    if (adjustedX < boundingBox.left) {
+      newX = boundingBox.left - activeNodeRect.left;
+    } else if (adjustedX + dimensions.width > boundingBox.right) {
+      newX = boundingBox.right - (activeNodeRect.left + dimensions.width);
+    }
+
+    //y pos
+    if (adjustedY < boundingBox.top) {
+      newY = boundingBox.top - activeNodeRect.top;
+    } else if (adjustedY + dimensions.height > boundingBox.bottom) {
+      newY = boundingBox.bottom - (activeNodeRect.top + dimensions.height);
+    }
+
+    return {
+      ...transform,
+      x: newX,
+      y: newY,
+    };
+  };
+```
+
+The modifier receives `transform` — the raw delta dnd-kit wants to apply — and
+`activeNodeRect`, which is the widget's current bounding rect before the drag
+is applied. Adding `transform.x` to `activeNodeRect.left` gives the projected
+new left edge. If that overshoots either boundary, `newX` is clamped to the
+exact value that brings the edge back in line.
+
+The `top: 58` accounts for the 50px header. `bottom: window.innerHeight + 8`
+and `right: window.innerWidth + 89` give a small bleed allowance so the widget
+doesn't feel like it snaps away from the cursor at the edge. Each widget's
+modifier uses slightly different values to match its position on screen and its
+relationship to the sidebar.
+
+<Callout type="note">
+    The modifier returns the **clamped transform**, not an absolute position.
+    dnd-kit applies this transform on top of the element's current CSS position,
+    so the math here is always relative to where the drag started, not where
+    the element is on screen.
+</Callout>
+
+## Position state — static + dynamic
+
+Inside each widget component, position is split into two parts that combine
+at render time:
+
+```ts
+// saved position from localStorage (persisted)
+const staticPosition = widgetInfo ? widgetInfo : { xPos: 0, yPos: 0 };
+
+const {
+  attributes,
+  listeners,
+  setNodeRef,
+  transform,
+  isDragging: dragging,
+} = useDraggable({
+  id: "todo-widget",
+});
+
+// live delta from dnd-kit during an active drag (not persisted until dragEnd)
+const dynamicPosition = transform
+  ? { x: transform.x, y: transform.y }
+  : { x: 0, y: 0 };
+
+// combined for CSS transform
+const combinedPosition = {
+  xPos: staticPosition.xPos + dynamicPosition.x,
+  yPos: staticPosition.yPos + dynamicPosition.y,
+};
+```
+
+`staticPosition` is the last saved `{xPos, yPos}` from `localStorage`.
+`dynamicPosition` is the live in-flight delta from `useDraggable` during a
+drag. Combining them in `combinedPosition` means the widget always appears at
+the right place — even mid-drag — without writing to state every frame.
+
+The combined position is applied via `transform: translate3d(...)`:
+
+```tsx
+style={{
+  transform: `translate3d(${combinedPosition.xPos}px, ${combinedPosition.yPos}px, 0)`,
+  position: "fixed",
+  width: dimensions.width,
+  height: dimensions.height,
+  zIndex: activeWidget === "todo" ? 100 : 50,
+}}
+```
+
+`translate3d` instead of `translate` promotes the element to its own
+compositor layer, which keeps drag animation smooth and avoids layout
+reflows.
+
+## Persisting position on drag end
+
+Each widget has its own `handleXxxDragEnd` callback in `WorkspaceContent`.
+They all follow the same pattern — accumulate the delta into the saved
+position and debounce the `localStorage` write:
+
+```ts
+const handleTodoDragEnd = useCallback(
+  (delta: { x: number; y: number }) => {
+    const currentTodo = widgetLayout.TodoWidget || { xPos: 0, yPos: 0 };
+    const newTodoInfo = {
+      ...currentTodo,
+      xPos: currentTodo.xPos + delta.x,
+      yPos: currentTodo.yPos + delta.y,
+    };
+    updateWidgetLayout("TodoWidget", newTodoInfo);
+  },
+  [updateWidgetLayout, widgetLayout.TodoWidget]
+);
+```
+
+`updateWidgetLayout` writes to React state immediately and schedules the
+`localStorage` save with a 500ms debounce:
+
+```ts
+const updateWidgetLayout = useCallback(
+  (widgetKey: keyof SavedWidgetLayoutInfo, newInfo: WidgetInfo) => {
+    const updatedLayout: SavedWidgetLayoutInfo = {
+      ...widgetLayout,
+      [widgetKey]: newInfo,
+    };
+    setWidgetLayout(updatedLayout);
+    const debounceSave = setTimeout(() => {
+      localStorage.setItem(localStorageKey, JSON.stringify(updatedLayout));
+    }, 500);
+    return () => clearTimeout(debounceSave);
+  },
+  [widgetLayout]
+);
+```
+
+<Callout type="tip">
+    The debounce is important — without it, fast drags ending in rapid succession
+    (e.g. double-clicking the drag handle) would queue multiple `localStorage`
+    writes. The 500ms window collapses them into one.
+</Callout>
+
+## Mounting positions on load
+
+On first render, `localStorage` is read inside a `requestAnimationFrame` to
+avoid blocking the paint. The `isClient` guard prevents SSR mismatches:
+
+```ts
+useEffect(() => {
+  const loadStoredData = () => {
+    try {
+      const [savedPosition, savedOpacity] = [
+        localStorage.getItem(localStorageKey),
+        localStorage.getItem(widgetOpacity),
+      ];
+
+      if (savedPosition) {
+        setWidgetLayout(JSON.parse(savedPosition));
+      }
+      if (savedOpacity) {
+        setOpacity(Number(savedOpacity));
+      }
+    } catch (error) {
+      console.warn("Failed to load from localStorage:", error);
+    }
+  };
+
+  setIsClient(true);
+
+  requestAnimationFrame(loadStoredData);
+}, []);
+```
+
+The component returns `null` until `isClient` is `true`, so no widget ever
+renders with a mismatched position on a Next.js server render.
+
+## Wiring DndContext per widget
+
+Each widget gets its own `DndContext` with its specific modifier. Using a
+shared `useId()` for the `id` prop prevents hydration warnings:
+
+```tsx
+const dndId = useId();
+
+{isTimerActive && (
+  <Suspense fallback={<WidgetSkeleton />}>
+    <DndContext
+      modifiers={[restrictToBoundingBox(openSettings)]}
+      onDragEnd={(event) => {
+        const { delta } = event;
+        handleTimerDragEnd(delta);
+      }}
+      id={dndId}
+    >
+      <PomoTimer
+        setOpenSettings={setOpenSettings}
+        openSettings={openSettings}
+        setIsTimerActive={setIsTimerActive}
+        widgetInfo={widgetLayout.TimerWidget}
+        activeWidget={activeWidget}
+        setActiveWidget={setActiveWidget}
+        opacity={opacity}
+      />
+    </DndContext>
+  </Suspense>
+)}
+```
+
+`modifiers` receives an array — the modifier factory is called once with any
+widget-specific arguments (like `openSettings` for the timer or `dimensions`
+for resizable widgets) and returns the actual `Modifier` function that dnd-kit
+calls on every pointer move.
+
+<Callout type="note">
+    Separate `DndContext` per widget is intentional. A single shared context
+    would mean dragging any widget triggers `onDragEnd` with ambiguous event
+    data — you'd have to check `event.active.id` everywhere. One context per
+    widget keeps the `onDragEnd` callback trivially simple.
+</Callout>
+
+## Resize logic
+
+The Todo widget (and Paint, Media) adds a bottom-right resize handle. The
+resize is handled entirely with native `mousedown` / `mousemove` / `mouseup`
+events — no dnd-kit involved:
+
+```ts
+const minWidth = 300;
+const minHeight = 300;
+const maxWidth = 1150;
+const maxHeight = 900;
+
+const handleMouseDown = useCallback(
+  (event: React.MouseEvent) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const startWidth = dimensions.width;
+    const startHeight = dimensions.height;
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      const deltaX = moveEvent.clientX - startX;
+      const deltaY = moveEvent.clientY - startY;
+      let newWidth = startWidth + deltaX;
+      let newHeight = startHeight + deltaY;
+
+      if (newWidth < minWidth) newWidth = minWidth;
+      if (newWidth > maxWidth) newWidth = maxWidth;
+      if (newHeight < minHeight) newHeight = minHeight;
+      if (newHeight > maxHeight) newHeight = maxHeight;
+
+      setDimensions({ width: newWidth, height: newHeight });
+    };
+
+    const handleMouseUp = () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+    };
+
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+  },
+  [dimensions.width, dimensions.height, setDimensions]
+);
+```
+
+On `mousedown` the handler captures the starting cursor position and widget
+dimensions. `mousemove` computes the delta and clamps it between `min/max`
+bounds. The listeners are cleaned up on `mouseup`. The current `dimensions`
+are passed into the bounding box modifier so the clamping area updates live
+as the widget is resized.
+
+The resize handle itself is an SVG dot grid in the bottom-right corner:
+
+```tsx
+<div className="flex justify-end">
+  <div onMouseDown={handleMouseDown}>
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      className="cursor-se-resize fill-white dark:fill-black"
+    >
+      <path d="M5.333 11.333a.667.667 0 100-1.333..." />
+    </svg>
+  </div>
+</div>
+```
+
+## Z-index focus management
+
+`activeWidget` is a union state in `WorkspaceContent` that tracks which widget
+was last interacted with. Each widget sets it on `mousedown`:
+
+```tsx
+<div onMouseDown={() => setActiveWidget("todo")} ...>
+```
+
+And reads it to decide its `zIndex`:
+
+```ts
+zIndex: activeWidget === "todo" ? 100 : 50,
+```
+
+Clicking any widget immediately brings it above all others without any
+`document`-level event delegation.
+
+## Lazy loading widgets
+
+All five widgets are lazy-loaded so they only enter the bundle when first
+toggled on:
+
+```ts
+const PomoTimer = lazy(() => import("./PomoTimer/PomoTimer"));
+const Task    = lazy(() => import("./Task/Task"));
+const Paint   = lazy(() => import("./Paint/Paint"));
+const Media   = lazy(() => import("./MediaPlayer/MediaPlayer"));
+const Calculator = lazy(() => import("./Calculator/Calculator"));
+
+const WidgetSkeleton = memo(() => (
+  <div className="animate-spin absolute">
+    <CgSpinnerAlt color="white" size={20} />
+  </div>
+));
+```
+
+Each `Suspense` boundary shows a minimal spinner. Because the fallback is
+`position: absolute` the spinner appears centred over the widget's launch
+point without shifting any layout.
+
+## Summary of the data flow
+
+```
+user drags widget
+  └── dnd-kit fires pointer events
+        └── modifier clamps transform to bounding box
+              └── combinedPosition = savedPos + clampedDelta  (renders live)
+                    └── onDragEnd fires
+                          └── handleXxxDragEnd adds delta to savedPos
+                                └── updateWidgetLayout → setState + debounced localStorage.setItem
+```
+
+The same flow runs for every widget. The only things that differ per widget
+are the modifier's bounding box constants and the widget key string passed to
+`updateWidgetLayout`.

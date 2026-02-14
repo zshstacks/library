@@ -1,0 +1,356 @@
+---
+title: Building the SublimeHub Landing Page
+description: All the animation and visual techniques behind the SublimeHub landing — mouse-follow glow, tw-animate-css reveal system, shimmer gradient text, floating dashboard preview, custom keyframe animations in JSX, grid background, and mobile menu slide.
+tags: [react, nextjs, tailwind, animation, css, ui, landing]
+readTime: 12
+date: 2025-05-11
+---
+
+## Preview
+
+<Screenshot src="/react/landing_preview.png"  alt="Landing preview"
+            caption="Landing preview"/>
+
+## Overview
+
+The landing is a single `LandingView` component with no animation libraries —
+just Tailwind, `tw-animate-css`, a few custom keyframes declared in a JSX
+`<style>` tag, and one piece of mouse-tracking state. Every visual effect is
+explained below.
+
+## Global styles foundation
+
+### CSS variables and dark theme
+
+The theme uses `oklch` for all color definitions. The SublimeHub dark
+background is `#07141b` and the accent is `#38CA6B` (emerald green):
+
+```css
+.dark {
+  --background: oklch(0.15 0.04 236); /* #07141b */
+  --primary: oklch(0.72 0.18 145);    /* #38CA6B */
+  --border: oklch(1 0 0 / 10%);
+}
+```
+
+Using `oklch` instead of hex for variable definitions gives perceptually
+uniform color mixing — gradients between two oklch values look more natural
+than the same gradient between two hex values.
+
+### Grid background
+
+```css
+@layer utilities {
+  .bg-grid-pattern {
+    background-size: 50px 50px;
+    background-image:
+      linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+    mask-image: linear-gradient(to bottom, black 40%, transparent 100%);
+  }
+}
+```
+
+Two overlapping linear gradients — one horizontal, one vertical — at 3%
+white opacity produce a barely-visible grid. The `mask-image` gradient fades
+the grid to transparent as it approaches the bottom of the viewport, so the
+pattern doesn't compete visually with content lower on the page.
+
+### Scrollbar
+
+```css
+::-webkit-scrollbar { width: 10px; }
+::-webkit-scrollbar-track { background: #07141b; }
+::-webkit-scrollbar-thumb {
+  background-color: #1a2c38;
+  border-radius: 9999px;
+  border: 2px solid #07141b;
+}
+::-webkit-scrollbar-thumb:hover { background-color: #38CA6B; }
+```
+
+The `border: 2px solid #07141b` on the thumb creates the illusion of padding
+between the thumb and the track by matching the track color. `border-radius: 9999px`
+makes it pill-shaped. Firefox gets the same treatment via `scrollbar-width: thin`
+and `scrollbar-color: #1a2c38 #07141b` on `*`.
+
+## Background layers
+
+The entire background is a stack of three `fixed inset-0` divs with
+`pointer-events-none` so they never intercept clicks:
+
+```tsx
+<div className="fixed inset-0 z-0 pointer-events-none">
+  {/* 1. grid */}
+  <div className="absolute inset-0 bg-grid-pattern opacity-30" />
+
+  {/* 2. vignette - darkens the grid toward the edges */}
+  <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,transparent_0%,#07141b_100%)]" />
+
+  {/* 3. mouse-follow glow */}
+  <div
+    className="absolute w-[400px] h-[400px] bg-[#38CA6B]/5 blur-[120px] rounded-full transition-transform duration-1000 ease-out hidden lg:block"
+    style={{
+      transform: `translate(${mousePos.x - 300}px, ${mousePos.y - 300}px)`,
+    }}
+  />
+</div>
+```
+
+Layer 1 is the grid. Layer 2 is a radial gradient going from transparent
+at the centre to the background color at the edges — this darkens the grid
+near the edges and creates a subtle depth effect. Layer 3 is the mouse glow.
+
+### Mouse-follow glow
+
+```tsx
+const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+
+useEffect(() => {
+  const handleMouseMove = (e: MouseEvent) => {
+    setMousePos({ x: e.clientX, y: e.clientY });
+  };
+  window.addEventListener("mousemove", handleMouseMove);
+  return () => window.removeEventListener("mousemove", handleMouseMove);
+}, []);
+```
+
+Raw cursor coordinates go into state on every `mousemove`. The glow element
+is a 400×400 div with `blur-[120px]` — the large blur radius turns it into
+a soft radial gradient that follows the cursor. The offset `mousePos.x - 300`
+(half of 400px) centres the element on the cursor rather than anchoring its
+top-left corner there.
+
+`transition-transform duration-1000 ease-out` on the element itself adds
+intentional lag — the glow trails behind the cursor with a 1-second ease
+instead of snapping to it instantly, which feels much more atmospheric.
+
+`hidden lg:block` keeps it desktop-only since a touch device never fires
+`mousemove`.
+
+<Callout type="tip">
+    Keep the glow opacity very low (`bg-[#38CA6B]/5` = 5%) and the blur very
+    high (`blur-[120px]`). A more visible glow reads as a UI bug; this level
+    is subconscious — users feel the page is alive without noticing why.
+</Callout>
+
+## Reveal animation system
+
+All entrance animations use `tw-animate-css`, which provides the
+`animate-in`, `fade-in`, `slide-in-from-bottom-4`, and `fill-mode-both`
+utility classes via:
+
+```css
+@import "tw-animate-css";
+```
+
+A shared class string is applied to every section:
+
+```tsx
+const revealClasses =
+  "animate-in fade-in slide-in-from-bottom-4 duration-1000 fill-mode-both";
+```
+
+Elements fade in while sliding up 16px (`bottom-4`). `fill-mode-both` means
+the element starts in the `from` state before the animation fires, preventing
+a flash of the visible final state on load. Staggered `delay-*` classes on
+each section create a waterfall effect:
+
+```tsx
+<div className={`text-left ${revealClasses} delay-200`}>   {/* hero text */}
+<div className={`... ${revealClasses} delay-500`}>          {/* hero card */}
+<div className={`... ${revealClasses} delay-600`}>          {/* features heading */}
+<div className={`... ${revealClasses} delay-700`}>          {/* uptime card */}
+<div className={`... ${revealClasses} delay-800`}>          {/* crypto card */}
+<div className={`... ${revealClasses} delay-900`}>          {/* tech stack */}
+```
+
+## Custom keyframe animations
+
+Three custom animations are defined in a JSX `<style>` block at the bottom
+of the component. Putting them here instead of in `globals.css` keeps them
+colocated with the component that uses them.
+
+```tsx
+<style jsx global>{`
+  @keyframes grow {
+    from { transform: scaleY(0.4); }
+    to   { transform: scaleY(1); }
+  }
+  .animate-grow {
+    animation: grow 1.5s ease-in-out infinite alternate;
+    transform-origin: bottom;
+  }
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0px); }
+    50%       { transform: translateY(-20px); }
+  }
+  .animate-float {
+    animation: float 6s ease-in-out infinite;
+  }
+
+  @keyframes shimmer {
+    0%   { background-position: 0% 50%; }
+    50%  { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+  }
+  .animate-shimmer {
+    animation: shimmer 3s ease-in-out infinite;
+  }
+`}</style>
+```
+
+### shimmer — gradient text
+
+The hero heading uses a moving gradient for the word "CONTROL.":
+
+```tsx
+<span className="text-transparent bg-clip-text bg-gradient-to-r from-[#38CA6B] via-emerald-200 to-[#38CA6B] bg-[length:200%_auto] animate-shimmer">
+  CONTROL.
+</span>
+```
+
+`bg-clip-text` + `text-transparent` makes the gradient show through the text
+shape. `bg-[length:200%_auto]` makes the gradient background twice as wide as
+the element so `background-position` can animate from `0%` to `100%` and back —
+the visible portion of the gradient shifts left to right, appearing to shimmer.
+
+### float — dashboard card
+
+The live dashboard preview on the right of the hero section floats:
+
+```tsx
+<div className={`relative hidden lg:block animate-float ${revealClasses} delay-500`}>
+```
+
+`float` oscillates `translateY` between `0px` and `-20px` over 6 seconds.
+The `ease-in-out` timing function means acceleration and deceleration at both
+ends, giving it a smooth breathing quality rather than a mechanical bounce.
+
+### grow — response latency bars
+
+The bar chart in the dashboard preview uses `animate-grow` with staggered
+`animationDelay` on each bar:
+
+```tsx
+{[40, 70, 45, 90, 65, 80, 55, 75].map((h, i) => (
+  <div
+    key={i}
+    className="flex-1 bg-[#38CA6B]/30 rounded-t-sm animate-grow"
+    style={{
+      height: `${h}%`,
+      animationDelay: `${i * 0.1}s`,
+    }}
+  />
+))}
+```
+
+`transform-origin: bottom` on the animation makes the bars grow upward from
+their base. `infinite alternate` means the animation reverses at the end
+instead of jumping back to the start — the bars gently pulse up and down.
+Each bar's 100ms stagger creates a wave effect across the chart.
+
+## Mobile menu
+
+The mobile menu slides in from above using a CSS transform transition rather
+than conditional rendering:
+
+```tsx
+<div
+  className={`fixed inset-0 z-[49] bg-[#07141b] flex flex-col items-center justify-center gap-8 transition-transform duration-500 md:hidden ${
+    isMenuOpen ? "translate-y-0" : "-translate-y-full"
+  }`}
+>
+```
+
+`fixed inset-0` makes it cover the entire screen. When `isMenuOpen` is
+`false`, `-translate-y-full` pushes it exactly 100% of its own height
+above the viewport — invisible but present in the DOM. When `isMenuOpen`
+flips to `true`, `translate-y-0` slides it back into view. `duration-500`
+and the CSS `transition-transform` handle the animation.
+
+This approach is preferable to unmounting the menu because the transition
+plays on both open and close, and there's no layout shift from the element
+entering or leaving the DOM.
+
+<Callout type="note">
+    The nav uses `z-50` and the mobile menu uses `z-[49]`. The nav stays
+    on top of the overlay so the close button (rendered in the nav) remains
+    clickable while the menu is open.
+</Callout>
+
+## Navbar backdrop blur
+
+```tsx
+<nav className="fixed top-0 inset-x-0 z-50 ... backdrop-blur-md border-b border-white/5">
+```
+
+`backdrop-blur-md` blurs everything behind the navbar, giving it a frosted
+glass effect as the user scrolls over content. `border-b border-white/5` adds
+a barely-visible bottom border that separates the nav from the page without
+being heavy.
+
+## Feature cards
+
+The two feature cards use hover-reveal inner glows:
+
+```tsx
+<div className="p-8 rounded-[2.5rem] bg-gradient-to-br from-[#38CA6B]/10 to-transparent border border-[#38CA6B]/20 hover:border-[#38CA6B]/40 transition-all group relative overflow-hidden">
+  {/* inner glow layer — fades in on hover */}
+  <div className="absolute inset-0 bg-gradient-to-br from-[#38CA6B]/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+  {/* content */}
+  <div className="relative z-10">...</div>
+</div>
+```
+
+The inner glow div starts at `opacity-0` and transitions to `opacity-100` on
+`group-hover`. Using a separate element for the hover glow (rather than
+changing the background of the card directly) allows the base gradient to
+coexist with the hover state gradient — the hover state adds intensity without
+replacing the resting appearance.
+
+`rounded-[2.5rem]` with `overflow-hidden` ensures the inner glow doesn't
+bleed outside the card's rounded corners.
+
+## Live ticker
+
+The marquee-style ticker in `globals.css`:
+
+```css
+@keyframes ticker {
+  0%   { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+.animate-ticker {
+  display: flex;
+  width: max-content;
+  animation: ticker 30s linear infinite;
+}
+
+.animate-ticker:hover {
+  animation-play-state: paused;
+}
+```
+
+The content is duplicated so the ticker is twice as wide as needed. Scrolling
+by exactly 50% (`translateX(-50%)`) positions the duplicate at the same
+starting point as the original, creating a seamless loop. Hover pauses it
+via `animation-play-state`.
+
+## Pulsing live indicator
+
+The "Live WebSocket Powered" badge in the hero uses a CSS ping animation to
+indicate active status:
+
+```tsx
+<span className="relative flex h-2 w-2">
+  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#38CA6B] opacity-75"></span>
+  <span className="relative inline-flex rounded-full h-2 w-2 bg-[#38CA6B]"></span>
+</span>
+```
+
+`animate-ping` is a built-in Tailwind animation that scales the element from
+`1` to `2` while fading from `opacity-75` to `0`. Stacking a static circle
+underneath gives the effect of a solid dot with an outward ripple.

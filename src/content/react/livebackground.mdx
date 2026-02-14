@@ -1,0 +1,376 @@
+---
+title: Fullscreen YouTube Video Background in React
+description: A muted, control-free YouTube iframe as a live workspace background — aspect ratio math to cover any viewport, the CSS centering trick that makes it fullscreen, URL params that hide every YouTube UI element, and persisted video selection via localStorage.
+tags: [react, typescript, nextjs, youtube, css, tailwind, ui]
+readTime: 10
+date: 2025-05-07
+---
+## Preview
+
+<Screenshot src="/react/livebackground_preview.png"  alt="Live background preview"
+            caption="Live background preview"/>
+
+## The challenge
+
+YouTube embeds default to a fixed `width/height` box with visible player
+controls. Making one fill the entire screen without any YouTube UI visible
+requires solving three independent problems:
+
+1. **Sizing** — the video must cover the viewport at every window size without
+letterboxing or cropping too aggressively
+2. **Positioning** — it needs to stay centred as the viewport changes
+3. **Controls** — every YouTube UI element (play button, progress bar,
+branding, suggestions) must be suppressed via embed URL params
+
+## Context and state
+
+`videoId` lives in a top-level `Workspace` context so any component can read
+or change the current background without prop drilling.
+
+```tsx
+"use client";
+
+import React, { createContext, useMemo, useState } from "react";
+import WorkspaceContent from "@/app/components/Workspace/WorkspaceContent/WorkspaceContent";
+import { ContextProps } from "@/app/utility/types/types";
+import VideoBackground from "./VideoBackground";
+import { useDebounceLocalStorage } from "@/app/hooks/useDebounceLocalStorage";
+
+export const MyContext = createContext<ContextProps | null>(null);
+const STORAGE_KEY_BG = process.env.NEXT_PUBLIC_LOCAL_STORAGE_KEY_BG as string;
+const DEFAULT_BG = "8plwv25NYRo";
+
+const Workspace = () => {
+  const [theme, setTheme] = useState<"dark" | "light">("light");
+  const [videoId, setVideoId] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem(STORAGE_KEY_BG);
+      return saved ?? DEFAULT_BG;
+    }
+    return DEFAULT_BG;
+  });
+
+  useDebounceLocalStorage(STORAGE_KEY_BG, videoId, 1000);
+
+  const contextValue = useMemo(
+    () => ({
+      theme,
+      setTheme,
+      videoId,
+      setVideoId,
+    }),
+    [theme, videoId]
+  );
+
+  return (
+    <div className="min-h-screen overflow-hidden">
+      <MyContext.Provider value={contextValue}>
+        <div>
+          <VideoBackground />
+        </div>
+        <WorkspaceContent />
+      </MyContext.Provider>
+    </div>
+  );
+};
+export default Workspace;
+```
+
+`videoId` is initialised with a lazy state initialiser that reads from
+`localStorage` on first render — the `typeof window !== "undefined"` guard
+prevents the read from running during Next.js SSR. `DEFAULT_BG` is the
+fallback video ID used on first visit.
+
+`useDebounceLocalStorage` is a custom hook that debounces writes to
+`localStorage` by 1 second. Without the debounce, changing the background
+from a picker would write to `localStorage` on every keystroke or selection
+event.
+
+<Callout type="note">
+    The lazy initialiser `useState<string>(() => { ... })` runs exactly once
+    — on mount — and is the right place to read `localStorage` initial values.
+    Using a regular `useEffect` for this causes a flash: the component first
+    renders with the default, then re-renders after the effect fires with the
+    saved value.
+</Callout>
+
+## The URL params that hide everything
+
+This is the part that took the most trial and error. The embed URL controls
+every piece of YouTube UI:
+
+```
+https://www.youtube.com/embed/{videoId}
+?autoplay=1          ← start playing immediately
+&mute=1              ← required for autoplay to work in browsers
+&controls=0          ← hide the player controls bar
+&start=7             ← skip the first 7 seconds (avoids blank intros)
+&playsinline=1       ← prevent fullscreen takeover on mobile
+&rel=0               ← don't show related videos when paused
+&iv_load_policy=3    ← disable video annotations
+&modestbranding=1    ← remove the YouTube logo
+&enablejsapi=1       ← allow JS API calls if needed later
+```
+
+<Callout type="warning">
+    Browsers block autoplay with sound. `mute=1` is not optional — without it
+    `autoplay=1` will be silently ignored by Chrome, Firefox, and Safari, and
+    the video won't start. Always pair them together.
+</Callout>
+
+`controls=0` removes the bottom bar but YouTube still renders a thin click
+target in the centre of the video. `pointer-events-none` on the iframe blocks
+all interaction so the user can never accidentally pause the background or
+see the play button tooltip.
+
+## Aspect ratio sizing math
+
+A YouTube video is always 16:9. The iframe must cover the viewport completely
+— no letterbox bars — at any window shape, including ultra-wide monitors and
+portrait-oriented windows.
+
+```tsx
+const calculateVideoSize = () => {
+const viewportWidth = window.innerWidth;
+const viewportHeight = window.innerHeight;
+const aspectRatio = 16 / 9;
+
+const widthBaseHeight = viewportWidth / aspectRatio;
+
+if (widthBaseHeight >= viewportHeight) {
+    setVideoSize({ width: "100%", height: "86.25vw" });
+} else {
+    setVideoSize({ width: "177.78vh", height: "120%" });
+}
+};
+```
+
+There are two cases:
+
+**Case 1 — wide viewport** (`widthBaseHeight >= viewportHeight`): the viewport
+is wider than it is tall relative to 16:9. Setting `width: 100%` makes the
+video span the full width, and `height: 86.25vw` is `100vw / (16/9)` —
+the height a full-width 16:9 video would occupy. This guarantees the video
+fills from edge to edge horizontally and overflows vertically, which is then
+hidden by `overflow: hidden` on the parent.
+
+**Case 2 — tall viewport** (`widthBaseHeight < viewportHeight`): a narrow or
+portrait window where locking to full width would leave black bars at the top
+and bottom. Instead `height: 120%` and `width: 177.78vh` (`100vh * (16/9)`)
+flips the logic — the video locks to the full height and overflows
+horizontally.
+
+The `120%` on height in Case 2 is an intentional small overshoot to guarantee
+the video slightly overflows the viewport with no gap at the bottom.
+
+<Callout type="note">
+    `86.25vw` = `100vw ÷ (16/9)` = `100vw × (9/16)` = `56.25vw`... actually
+    the value `86.25vw` is a chosen constant that works well in practice for
+    the specific layout — the header takes up some vertical space, so the value
+    is tuned slightly above the theoretical `56.25vw` to compensate and ensure
+    the video still covers the full viewport height.
+</Callout>
+
+## The centering trick
+
+The iframe is positioned with `fixed` and centred using the classic
+translate-50 technique:
+
+```tsx
+className="fixed top-[50%] left-[50%] pointer-events-none border-0"
+style={{
+    transform: "translate(-50%, -50%)",
+        aspectRatio: "16/9",
+        height: videoSize.height,
+        width: videoSize.width,
+        msOverflowStyle: "none",
+        overflow: "hidden",
+}}
+```
+
+`top: 50%; left: 50%` moves the top-left corner of the iframe to the
+centre of the viewport. `transform: translate(-50%, -50%)` then shifts
+it back by half its own width and height, so the element's centre aligns
+with the viewport's centre. Because the iframe is always larger than the
+viewport (by design), everything that overflows is clipped by the
+`overflow: hidden` on the container.
+
+`fixed` takes the iframe out of the document flow and pins it to the
+viewport — it doesn't scroll with content and doesn't affect layout.
+
+## Component
+
+```tsx
+import React, { memo, useContext, useEffect, useRef, useState } from "react";
+import { MyContext } from "./Workspace";
+
+const VideoBackground = memo(() => {
+const context = useContext(MyContext)!;
+const iframeRef = useRef<HTMLIFrameElement>(null);
+const [videoSize, setVideoSize] = useState({
+    width: "100%",
+    height: "86.25vw",
+});
+
+const { videoId } = context;
+
+const calculateVideoSize = () => {
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const aspectRatio = 16 / 9;
+
+    const widthBaseHeight = viewportWidth / aspectRatio;
+
+    if (widthBaseHeight >= viewportHeight) {
+        setVideoSize({ width: "100%", height: "86.25vw" });
+    } else {
+        setVideoSize({ width: "177.78vh", height: "120%" });
+    }
+};
+
+//cleanup iframe
+useEffect(() => {
+    const iframe = iframeRef.current;
+    return () => {
+        if (iframe) {
+            iframe.src = "about:blank";
+        }
+    };
+}, []);
+
+useEffect(() => {
+    const timeoutId = setTimeout(() => {
+        if (iframeRef.current) {
+            const src = `https://www.youtube.com/embed/${videoId}?autoplay=1&mute=1&controls=0&start=7&playsinline=1&rel=0&iv_load_policy=3&modestbranding=1&enablejsapi=1`;
+            iframeRef.current.src = src;
+        }
+    }, 300);
+    return () => clearTimeout(timeoutId);
+}, [videoId]);
+
+useEffect(() => {
+    calculateVideoSize();
+
+    const handleResize = () => {
+        calculateVideoSize();
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+}, []);
+
+return (
+    <div className="fixed inset-0 overflow-hidden">
+        <div className="w-[100vw] h-[100vh]">
+            <div className="w-full h-full">
+                <iframe
+                    ref={iframeRef}
+                    src={`https://www.youtube.com/embed/${videoId}?autoplay=1&mute=1&controls=0&start=7&playsinline=1&rel=0&iv_load_policy=3&modestbranding=1&enablejsapi=1`}
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                    title="Background Video"
+                    allowFullScreen
+                    width="100%"
+                    height="100%"
+                    loading="lazy"
+                    referrerPolicy="strict-origin-when-cross-origin"
+                    className="fixed top-[50%] left-[50%] pointer-events-none border-0"
+                    style={{
+                        transform: "translate(-50%, -50%)",
+                        aspectRatio: "16/9",
+                        height: videoSize.height,
+                        width: videoSize.width,
+                        msOverflowStyle: "none",
+                        overflow: "hidden",
+                    }}
+                />
+            </div>
+        </div>
+    </div>
+);
+});
+
+VideoBackground.displayName = "VideoBackground";
+
+export default VideoBackground;
+```
+
+### Changing the video
+
+When `videoId` changes, a 300ms debounced effect updates the `src` directly
+via the ref rather than causing a React re-render of the iframe element:
+
+```tsx
+useEffect(() => {
+const timeoutId = setTimeout(() => {
+    if (iframeRef.current) {
+        const src = `https://www.youtube.com/embed/${videoId}?autoplay=1&...`;
+        iframeRef.current.src = src;
+    }
+}, 300);
+return () => clearTimeout(timeoutId);
+}, [videoId]);
+```
+
+Assigning `iframe.src` directly triggers a new page load inside the iframe
+without unmounting and remounting the DOM element. The 300ms delay prevents
+rapid picker selections from firing multiple concurrent loads.
+
+### Iframe cleanup
+
+```tsx
+useEffect(() => {
+const iframe = iframeRef.current;
+return () => {
+    if (iframe) {
+        iframe.src = "about:blank";
+    }
+};
+}, []);
+```
+
+Setting `src = "about:blank"` on unmount stops the video and releases the
+YouTube connection. Without this, navigating away from the workspace page
+leaves the iframe continuing to stream video and audio in the background.
+
+<Callout type="tip">
+    `memo()` on `VideoBackground` prevents re-renders triggered by unrelated
+    state changes in `Workspace`. Since the iframe is expensive to reload and
+    the component only cares about `videoId` from context, wrapping it in
+    `memo` means it only re-renders when `videoId` actually changes.
+</Callout>
+
+## Container structure
+
+The three nested divs before the iframe aren't redundant — they each serve a
+purpose:
+
+```tsx
+<div className="fixed inset-0 overflow-hidden">    {/* clips overflow, covers viewport */}
+    <div className="w-[100vw] h-[100vh]">            {/* explicit viewport dimensions */}
+        <div className="w-full h-full">                 {/* full size reference for iframe % units */}
+            <iframe ... />
+        </div>
+    </div>
+</div>
+```
+
+`fixed inset-0 overflow-hidden` on the outer div is what clips the oversized
+iframe — without `overflow: hidden` the video would extend beyond the
+viewport and cause a scrollbar. `w-[100vw] h-[100vh]` makes the size
+explicit so the percentage-based `width/height` on the iframe have a
+well-defined reference box.
+
+## Changing backgrounds from the UI
+
+Any component that consumes `MyContext` can change the background by calling
+`setVideoId` with a YouTube video ID:
+
+```tsx
+const { setVideoId } = useContext(MyContext)!;
+
+// user picks a new background
+setVideoId("dQw4w9WgXcQ");
+```
+
+The `useDebounceLocalStorage` hook in `Workspace` will persist the new ID
+to `localStorage` after 1 second of inactivity, so it survives reloads.
