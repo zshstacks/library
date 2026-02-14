@@ -1,0 +1,984 @@
+---
+title: Crypto Module — Live Prices, Market Data & Favorites
+description: The full SublimeHub crypto module — GORM models with many-to-many relations, a WebSocket price hub, Binance stream, CoinGecko market cap sync, Etherscan gas price, and a favorites toggle.
+tags: [golang, echo, gorm, websocket, binance, coingecko, realtime]
+readTime: 16
+date: 2025-04-28
+---
+
+## Preview
+
+<Screenshot src="/crypto_preview.png"  alt="Crypto module preview"
+            caption="Crypto module preview"/>
+
+## Module overview
+
+The crypto module does five things independently:
+
+1. Syncs the coin list from Binance's exchange info endpoint on startup
+2. Pulls market cap and volume data from CoinGecko every 5 minutes
+3. Pulls global market stats (total cap, BTC dominance, ETH gas) every 10 minutes
+4. Streams live ticker prices from Binance's `!ticker@arr` WebSocket to all connected browser clients
+5. Lets authenticated users toggle coins in and out of a personal favorites list
+
+All of this is wired up in a single `RegisterRoutes` call — no changes needed anywhere else in the application.
+
+## Project structure
+
+```
+modules/crypto/
+├── controllers/
+│   └── crypto.go        ← HTTP + WebSocket handlers
+├── helpers/
+├── models/             rgba(129, 230, 217)
+│   ├── category.go
+│   ├── coin.go
+│   └── marketStats.go
+├── worker/
+│   ├── binance_stream.go  ← live WS feed from Binance
+│   ├── binance_sync.go    ← initial coin list sync
+│   ├── market_cap_sync.go ← CoinGecko market cap
+│   ├── market_stats.go    ← CoinGecko global + ETH gas
+│   └── seed.go            ← category seeding + assignment
+├── hub.go               ← WebSocket broadcast hub
+└── routes.go            ← RegisterRoutes, starts all workers
+```
+
+## Models
+
+### Coin
+
+```go
+package models
+
+import (
+    "time"
+
+    "gorm.io/gorm"
+)
+
+type Coin struct {
+    ID         uint           `gorm:"primarykey" json:"id"`
+    CreatedAt  time.Time      `json:"createdAt"`
+    UpdatedAt  time.Time      `json:"updatedAt"`
+    DeletedAt  gorm.DeletedAt `gorm:"index" json:"deletedAt,omitempty"`
+    Symbol     string         `gorm:"uniqueIndex;not null" json:"symbol"`
+    Name       string         `gorm:"not null" json:"name"`
+    BaseAsset  string         `gorm:"not null" json:"baseAsset"`
+    Rank       int            `gorm:"index" json:"rank"`
+    MarketCap  *float64       `json:"marketCap,omitempty"`
+    Volume24h  *float64       `json:"volume24h,omitempty"`
+    Categories []Category     `gorm:"many2many:coin_categories;" json:"categories"`
+}
+```
+
+`MarketCap` and `Volume24h` are pointer types so GORM can distinguish between
+"not yet populated" (`nil`) and "genuinely zero". `omitempty` on both means
+newly synced coins with no market data yet don't produce `"marketCap": null`
+in JSON responses.
+
+### Category
+
+```go
+package models
+
+import "gorm.io/gorm"
+
+type Category struct {
+    gorm.Model
+    Name  string `gorm:"uniqueIndex;not null" json:"name"`
+    Slug  string `gorm:"uniqueIndex;not null" json:"slug"`
+    Coins []Coin `gorm:"many2many:coin_categories;" json:"coins,omitempty"`
+}
+```
+
+The `coin_categories` join table is managed entirely by GORM's
+`many2many` tag. Neither side needs to hold a foreign key column —
+GORM creates the pivot table automatically via `AutoMigrate`.
+
+### MarketStats
+
+```go
+package models
+
+import "gorm.io/gorm"
+
+type MarketStats struct {
+    gorm.Model
+    TotalMarketCap  float64 `json:"totalMarketCap"`
+    MarketCapChange float64 `json:"marketCapChange"` // percen. change
+    Volume24h       float64 `json:"volume24h"`
+    BTCDominance    float64 `json:"btcDominance"`
+    EthGasPrice     int     `json:"ethGasPrice"`
+}
+```
+
+There is only ever one row in this table. The sync worker hardcodes `stats.ID = 1`
+before calling `db.Save`, so every sync is an upsert on the same record rather
+than an ever-growing append.
+
+### User ↔ Coin favorites
+
+The `User` model holds the other side of the many-to-many:
+
+```go
+Favorites []models.Coin `gorm:"many2many:user_favorites;" json:"favorites"`
+```
+
+GORM creates a `user_favorites` pivot table with `user_id` and `coin_id`
+columns. Toggling a favorite is then a single `Association("Favorites").Append`
+or `.Delete` call — no manual SQL needed.
+
+## Workers
+
+### binance_sync.go — initial coin list
+
+```go
+package worker
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+
+    "github.com/zshstacks/markdown-zsh/modules/crypto/models"
+    "gorm.io/gorm"
+    "gorm.io/gorm/clause"
+)
+
+// this is the main structure returned by the Binance API
+type BinanceExchangeInfo struct {
+    Symbols []BinanceSymbol `json:"symbols"`
+}
+
+// describes one trading pair (example: BTCUSDT)
+type BinanceSymbol struct {
+    Symbol     string `json:"symbol"`     // "BTCUSDT"
+    Status     string `json:"status"`     // "TRADING"
+    BaseAsset  string `json:"baseAsset"`  // "BTC"
+    QuoteAsset string `json:"quoteAsset"` // "USDT"
+}
+
+func FetchAndSyncCoins(db *gorm.DB) error {
+
+    resp, err := http.Get("https://api.binance.com/api/v3/exchangeInfo")
+    if err != nil {
+       return fmt.Errorf("failed to fetch from binance: %w", err)
+    }
+    defer resp.Body.Close()
+
+    var info BinanceExchangeInfo
+    if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+       return fmt.Errorf("failed to decode binance json: %w", err)
+    }
+
+    var coinsToSync []models.Coin
+
+    for _, s := range info.Symbols {
+       if s.QuoteAsset == "USDT" && s.Status == "TRADING" {
+          coinsToSync = append(coinsToSync, models.Coin{
+             Symbol:    s.Symbol,
+             Name:      s.BaseAsset,
+             BaseAsset: s.BaseAsset,
+             Rank:      999,
+          })
+       }
+    }
+
+    if len(coinsToSync) > 0 {
+       err := db.Clauses(clause.OnConflict{
+          Columns:   []clause.Column{{Name: "symbol"}},
+          DoUpdates: clause.AssignmentColumns([]string{"name", "base_asset"}),
+       }).Create(&coinsToSync).Error
+
+       if err != nil {
+          return fmt.Errorf("failed to sync coins to db: %w", err)
+       }
+    }
+    return nil
+}
+```
+
+Only USDT-quoted pairs with status `"TRADING"` are imported. New symbols are
+inserted; existing ones have `name` and `base_asset` updated in place.
+`clause.OnConflict` compiles to a single `INSERT ... ON CONFLICT DO UPDATE`
+statement — one round-trip for hundreds of coins.
+
+<Callout type="note">
+    All coins start with `Rank: 999`. The actual rank comes from the CoinGecko
+    market cap sync — coins that don't appear in CoinGecko's top 250 keep the
+    placeholder rank.
+</Callout>
+
+### market_cap_sync.go — CoinGecko market cap
+
+```go
+package worker
+
+import (
+    "encoding/json"
+    "io"
+    "log"
+    "net/http"
+    "strings"
+    "time"
+
+    "github.com/zshstacks/markdown-zsh/modules/crypto/models"
+    "gorm.io/gorm"
+)
+
+type CoinGeckoMarket struct {
+    ID           string  `json:"id"`
+    Symbol       string  `json:"symbol"`
+    Name         string  `json:"name"`
+    MarketCap    float64 `json:"market_cap"`
+    TotalVolume  float64 `json:"total_volume"`
+    CurrentPrice float64 `json:"current_price"`
+}
+
+func SyncMarketCapData(db *gorm.DB) {
+    log.Println("Starting market cap sync...")
+
+    url := "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1&sparkline=false"
+
+    client := &http.Client{Timeout: 30 * time.Second}
+    resp, err := client.Get(url)
+    if err != nil {
+       log.Printf("Failed to fetch market cap data: %v", err)
+       return
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+       body, _ := io.ReadAll(resp.Body)
+       log.Printf("CoinGecko API error (status %d): %s", resp.StatusCode, string(body))
+       return
+    }
+
+    var geckoData []CoinGeckoMarket
+    if err := json.NewDecoder(resp.Body).Decode(&geckoData); err != nil {
+       log.Printf("Failed to decode market cap data: %v", err)
+       return
+    }
+
+    log.Printf("Fetched %d coins from CoinGecko", len(geckoData))
+
+    updated := 0
+    for _, gecko := range geckoData {
+
+       var coin models.Coin
+       symbol := strings.ToUpper(gecko.Symbol)
+
+       result := db.Where("UPPER(base_asset) = ?", symbol).First(&coin)
+       if result.Error != nil {
+
+          result = db.Where("symbol = ?", symbol+"USDT").First(&coin)
+          if result.Error != nil {
+             continue
+          }
+       }
+
+       coin.MarketCap = &gecko.MarketCap
+       coin.Volume24h = &gecko.TotalVolume
+
+       if err := db.Save(&coin).Error; err != nil {
+          log.Printf("Failed to update %s: %v", coin.Symbol, err)
+          continue
+       }
+
+       updated++
+    }
+
+    log.Printf("Market cap sync completed: updated %d coins", updated)
+}
+
+func StartMarketCapSync(db *gorm.DB) {
+
+    SyncMarketCapData(db)
+
+    ticker := time.NewTicker(5 * time.Minute)
+    go func() {
+       for range ticker.C {
+          SyncMarketCapData(db)
+       }
+    }()
+}
+```
+
+CoinGecko uses lowercase symbols (`"btc"`) while the DB stores Binance's
+`BaseAsset` (`"BTC"`). The lookup tries `UPPER(base_asset)` first, then
+falls back to appending `"USDT"` and matching the full symbol. This two-pass
+approach handles the vast majority of coins without needing a separate
+symbol-mapping table.
+
+<Callout type="tip">
+    The free CoinGecko API has a rate limit of roughly 10–30 requests per
+    minute. A 5-minute ticker for 250 coins in a single request stays well
+    within that. If you add more pages, add a `time.Sleep` between calls or
+    upgrade to the Pro tier.
+</Callout>
+
+### market_stats.go — global stats + ETH gas
+
+```go
+package worker
+
+import (
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "time"
+
+    "github.com/zshstacks/markdown-zsh/modules/crypto/models"
+    "gorm.io/gorm"
+)
+
+type CoinGeckoGlobalResponse struct {
+    Data struct {
+       TotalMarketCap                  map[string]float64 `json:"total_market_cap"`
+       TotalVolume                     map[string]float64 `json:"total_volume"`
+       MarketCapPercentage             map[string]float64 `json:"market_cap_percentage"`
+       MarketCapChangePercentage24hUsd float64            `json:"market_cap_change_percentage_24h_usd"`
+       UpdatedAt                       int64              `json:"updated_at"`
+    } `json:"data"`
+}
+
+type EtherscanGasResponse struct {
+    Status  string `json:"status"`
+    Message string `json:"message"`
+    Result  struct {
+       SafeGasPrice    string `json:"SafeGasPrice"`
+       ProposeGasPrice string `json:"ProposeGasPrice"`
+       FastGasPrice    string `json:"FastGasPrice"`
+    } `json:"result"`
+}
+
+func SyncMarketStats(db *gorm.DB) error {
+    log.Println("Syncing market stats...")
+
+    // Fetch global market data from CoinGecko
+    resp, err := http.Get("https://api.coingecko.com/api/v3/global")
+    if err != nil {
+       log.Printf("Failed to fetch CoinGecko data: %v", err)
+       return err
+    }
+    defer resp.Body.Close()
+
+    var cgData CoinGeckoGlobalResponse
+    if err := json.NewDecoder(resp.Body).Decode(&cgData); err != nil {
+       log.Printf("Failed to decode CoinGecko data: %v", err)
+       return err
+    }
+
+    // Fetch ETH gas price from Etherscan
+    gasPrice := fetchEthGasPrice()
+
+    // Create or update stats
+    stats := models.MarketStats{
+       TotalMarketCap:  cgData.Data.TotalMarketCap["usd"],
+       MarketCapChange: cgData.Data.MarketCapChangePercentage24hUsd,
+       Volume24h:       cgData.Data.TotalVolume["usd"],
+       BTCDominance:    cgData.Data.MarketCapPercentage["btc"],
+       EthGasPrice:     gasPrice,
+    }
+
+    stats.ID = 1
+
+    if err := db.Save(&stats).Error; err != nil {
+       log.Printf("Failed to save market stats: %v", err)
+       return err
+    }
+
+    log.Printf("Market stats updated: Cap=$%.2fT (%.2f%%), Vol=$%.2fB, BTC=%.1f%%, Gas=%d gwei",
+       stats.TotalMarketCap/1_000_000_000_000,
+       stats.MarketCapChange,
+       stats.Volume24h/1_000_000_000,
+       stats.BTCDominance,
+       stats.EthGasPrice,
+    )
+
+    return nil
+}
+
+func fetchEthGasPrice() int {
+    client := &http.Client{Timeout: 10 * time.Second}
+
+    //  Etherscan API (free, no key needed)
+    resp, err := client.Get("https://api.etherscan.io/api?module=gastracker&action=gasoracle")
+    if err != nil {
+       log.Printf("Failed to fetch gas price: %v", err)
+       return 20
+    }
+    defer resp.Body.Close()
+
+    var gasData EtherscanGasResponse
+    if err := json.NewDecoder(resp.Body).Decode(&gasData); err != nil {
+       log.Printf("Failed to decode gas data: %v", err)
+       return 20
+    }
+
+    if gasData.Status != "1" {
+       log.Printf("Etherscan API error: %s", gasData.Message)
+       return 20
+    }
+
+    //  "ProposeGasPrice" (standard gas price)
+    var price int
+    _, err = fmt.Sscanf(gasData.Result.ProposeGasPrice, "%d", &price)
+    if err != nil {
+       log.Printf("Failed to parse gas price: %v", err)
+       return 20
+    }
+
+    return price
+}
+```
+
+`CoinGeckoGlobalResponse.Data.TotalMarketCap` is a map keyed by currency
+code — `["usd"]` extracts the USD value. Same pattern for `TotalVolume` and
+`MarketCapPercentage`. `fetchEthGasPrice` returns `20` as a sensible default
+on any error so a transient Etherscan failure never leaves the stats record
+with a zero gas price.
+
+### seed.go — categories and coin assignments
+
+```go
+package worker
+
+import (
+    "log"
+
+    "github.com/zshstacks/markdown-zsh/modules/crypto/models"
+    "gorm.io/gorm"
+)
+
+func SeedCategories(db *gorm.DB) {
+    log.Println("Seeding categories...")
+
+    categories := []models.Category{
+       {Name: "Layer 1 Networks", Slug: "layer-1"},
+       {Name: "DeFi Ecosystem", Slug: "defi"},
+       {Name: "AI & Machine Learning", Slug: "ai"},
+       {Name: "Gaming & NFT", Slug: "gaming-nft"},
+       {Name: "Layer 2 Solutions", Slug: "layer-2"},
+       {Name: "Meme Coins", Slug: "meme"},
+       {Name: "Stablecoins", Slug: "stablecoins"},
+    }
+
+    for _, cat := range categories {
+       var existing models.Category
+       err := db.Where("slug = ?", cat.Slug).First(&existing).Error
+
+       if err == gorm.ErrRecordNotFound {
+          if err := db.Create(&cat).Error; err != nil {
+             log.Printf("Failed to create category %s: %v", cat.Name, err)
+          } else {
+             log.Printf("Created category: %s", cat.Name)
+          }
+       } else {
+          log.Printf("Category already exists: %s", cat.Name)
+       }
+    }
+
+    // Assign some coins to categories based on their symbols
+    assignCoinsToCategories(db)
+}
+
+func assignCoinsToCategories(db *gorm.DB) {
+    log.Println("Assigning coins to categories...")
+
+    // Layer 1 coins
+    layer1Symbols := []string{"BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "ATOMUSDT"}
+    assignCoinsBySymbol(db, layer1Symbols, "layer-1")
+
+    // DeFi coins
+    defiSymbols := []string{"UNIUSDT", "AAVEUSDT", "CRVUSDT", "COMPUSDT", "MKRUSDT", "SNXUSDT"}
+    assignCoinsBySymbol(db, defiSymbols, "defi")
+
+    // Gaming & NFT
+    gamingSymbols := []string{"AXSUSDT", "SANDUSDT", "MANAUSDT", "ENJUSDT", "GALAUSDT"}
+    assignCoinsBySymbol(db, gamingSymbols, "gaming-nft")
+
+    // Meme coins
+    memeSymbols := []string{"DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "FLOKIUSDT", "BONKUSDT"}
+    assignCoinsBySymbol(db, memeSymbols, "meme")
+
+    // Stablecoins
+    stableSymbols := []string{"USDTUSDT", "USDCUSDT", "BUSDUSDT", "DAIUSDT", "FDUSDUSDT"}
+    assignCoinsBySymbol(db, stableSymbols, "stablecoins")
+
+    // Layer 2
+    layer2Symbols := []string{"MATICUSDT", "ARBUSDT", "OPUSDT", "IMXUSDT"}
+    assignCoinsBySymbol(db, layer2Symbols, "layer-2")
+}
+
+func assignCoinsBySymbol(db *gorm.DB, symbols []string, categorySlug string) {
+    var category models.Category
+    if err := db.Where("slug = ?", categorySlug).First(&category).Error; err != nil {
+       log.Printf("Category not found: %s", categorySlug)
+       return
+    }
+
+    for _, symbol := range symbols {
+       var coin models.Coin
+       if err := db.Where("symbol = ?", symbol).First(&coin).Error; err != nil {
+          continue
+       }
+
+       // Check if association already exists
+       var count int64
+       db.Table("coin_categories").
+          Where("coin_id = ? AND category_id = ?", coin.ID, category.ID).
+          Count(&count)
+
+       if count == 0 {
+          if err := db.Model(&coin).Association("Categories").Append(&category); err != nil {
+             log.Printf("Failed to assign %s to %s: %v", coin.Symbol, category.Name, err)
+          } else {
+             log.Printf("Assigned %s to %s", coin.Symbol, category.Name)
+          }
+       }
+    }
+}
+```
+
+`SeedCategories` is idempotent — checking `gorm.ErrRecordNotFound` before
+creating means re-running on startup never duplicates categories. The
+`assignCoinsBySymbol` helper counts existing pivot rows before appending, so
+associations are equally safe to re-run.
+
+<Callout type="note">
+    The seeding runs **after** `FetchAndSyncCoins` completes in `RegisterRoutes`,
+    so the coins it needs to assign always exist in the database by the time
+    `assignCoinsToCategories` runs.
+</Callout>
+
+### binance_stream.go — live WebSocket feed
+
+```go
+package worker
+
+import (
+    "context"
+    "encoding/json"
+    "log"
+
+    "github.com/coder/websocket"
+    "github.com/coder/websocket/wsjson"
+)
+
+func StartBinanceStream(ctx context.Context, broadcast chan []byte) {
+    url := "wss://stream.binance.com:9443/ws/!ticker@arr"
+
+    for {
+       select {
+       case <-ctx.Done():
+          return
+       default:
+          conn, _, err := websocket.Dial(ctx, url, nil)
+          if err != nil {
+             log.Printf("Binance WS Dial error: %v", err)
+             continue
+          }
+
+          conn.SetReadLimit(512 * 1024)
+
+          for {
+             var msg interface{}
+
+             err := wsjson.Read(ctx, conn, &msg)
+             if err != nil {
+                log.Printf("Binance WS Read error: %v", err)
+                break
+             }
+
+             data, _ := json.Marshal(msg)
+             broadcast <- data
+          }
+          conn.Close(websocket.StatusNormalClosure, "")
+       }
+    }
+}
+```
+
+`!ticker@arr` is Binance's all-market ticker stream — one message contains
+price updates for every actively traded symbol, delivered roughly every second.
+`conn.SetReadLimit(512 * 1024)` raises the default message size cap since the
+full ticker array for all symbols can exceed the default limit.
+
+The outer `for` loop is the reconnect loop — if the inner read loop breaks on
+any error, the outer loop immediately re-dials without sleeping. The
+`broadcast` channel is the `PriceHub.Broadcast` channel, so every message
+goes straight to all connected browser clients.
+
+<Callout type="warning">
+    The `broadcast <- data` send is blocking. If `PriceHub.Run` is not draining
+    the channel fast enough, the Binance stream goroutine will stall. The hub's
+    channel is buffered at 100, which absorbs brief bursts, but sustained slow
+    consumers will eventually block here. For production, consider a non-blocking
+    send with a drop-on-full policy.
+</Callout>
+
+## PriceHub
+
+```go
+package crypto
+
+import (
+    "context"
+    "sync"
+    "time"
+
+    "github.com/coder/websocket"
+)
+
+type PriceHub struct {
+    clients    map[*websocket.Conn]struct{}
+    register   chan *websocket.Conn
+    unregister chan *websocket.Conn
+    mu         sync.RWMutex
+    Broadcast  chan []byte
+}
+
+func NewPriceHub() *PriceHub {
+    return &PriceHub{
+       clients:    make(map[*websocket.Conn]struct{}),
+       register:   make(chan *websocket.Conn),
+       unregister: make(chan *websocket.Conn),
+       Broadcast:  make(chan []byte, 100),
+    }
+}
+
+func (h *PriceHub) AddClient(conn *websocket.Conn) {
+    h.register <- conn
+}
+
+func (h *PriceHub) RemoveClient(conn *websocket.Conn) {
+    h.unregister <- conn
+}
+
+func (h *PriceHub) Run(ctx context.Context) {
+    for {
+       select {
+       case <-ctx.Done():
+          return
+       case conn := <-h.register:
+          h.mu.Lock()
+          h.clients[conn] = struct{}{}
+          h.mu.Unlock()
+       case conn := <-h.unregister:
+          h.mu.Lock()
+          delete(h.clients, conn)
+          h.mu.Unlock()
+       case msg := <-h.Broadcast:
+          h.mu.RLock()
+          for client := range h.clients {
+
+             go func(c *websocket.Conn, m []byte) {
+                writeCtx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+                defer cancel()
+                c.Write(writeCtx, websocket.MessageText, m)
+             }(client, msg)
+          }
+          h.mu.RUnlock()
+       }
+    }
+}
+```
+
+Registration and deregistration go through channels rather than being called
+directly inside the mutex, keeping the lock only around the map operations. Each
+client write is spawned as its own goroutine with a 3-second timeout — a slow
+or stalled browser connection can't block delivery to other clients.
+
+## Controller
+
+### WSProvider interface
+
+```go
+type WSProvider interface {
+    AddClient(conn *websocket.Conn)
+    RemoveClient(conn *websocket.Conn)
+}
+
+type CryptoController struct {
+    db  *gorm.DB
+    cfg infrastructure.AppConfig
+    hub WSProvider
+}
+```
+
+The controller depends on the `WSProvider` interface rather than `*PriceHub`
+directly. This keeps the controller testable — you can inject a fake hub that
+records calls without running a real WebSocket server.
+
+### ListCoins — filtering and sorting
+
+```go
+func (cc *CryptoController) ListCoins(c echo.Context) error {
+	filter := c.QueryParam("filter")     // "gainers", "new", or empty for all
+	category := c.QueryParam("category") // category slug
+
+	log.Printf("ListCoins called with filter=%s, category=%s", filter, category)
+
+	query := cc.db.Preload("Categories")
+
+	// Filter by category
+	if category != "" && category != "all" {
+		query = query.Joins("JOIN coin_categories ON coin_categories.coin_id = coins.id").
+			Joins("JOIN categories ON categories.id = coin_categories.category_id").
+			Where("categories.slug = ?", category)
+	}
+
+	var coins []models.Coin
+	if err := query.Find(&coins).Error; err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Could not fetch coins"})
+	}
+
+	log.Printf("Found %d coins before filtering", len(coins))
+
+	// Apply filters
+	switch filter {
+	case "gainers":
+		// Sort by 24h volume (highest volume = top gainers)
+		var gainers []models.Coin
+		for _, coin := range coins {
+			if coin.Volume24h != nil && *coin.Volume24h > 0 {
+				gainers = append(gainers, coin)
+			}
+		}
+		// Sort by volume descending using sort.Slice
+		sort.Slice(gainers, func(i, j int) bool {
+			return *gainers[i].Volume24h > *gainers[j].Volume24h
+		})
+		log.Printf("Returning %d gainers", len(gainers))
+		return c.JSON(http.StatusOK, gainers)
+
+	case "new":
+		// Get coins created in the last 30 days
+		thirtyDaysAgo := time.Now().AddDate(0, 0, -30)
+		var newCoins []models.Coin
+		for _, coin := range coins {
+			if coin.CreatedAt.After(thirtyDaysAgo) {
+				newCoins = append(newCoins, coin)
+			}
+		}
+		// Sort by creation date (newest first)
+		sort.Slice(newCoins, func(i, j int) bool {
+			return newCoins[i].CreatedAt.After(newCoins[j].CreatedAt)
+		})
+		log.Printf("Returning %d new coins (created after %v)", len(newCoins), thirtyDaysAgo)
+		return c.JSON(http.StatusOK, newCoins)
+
+	default:
+		// Return all coins sorted by market cap
+		var sortedCoins []models.Coin
+		for _, coin := range coins {
+			if coin.MarketCap != nil && *coin.MarketCap > 0 {
+				sortedCoins = append(sortedCoins, coin)
+			}
+		}
+		// Sort by market cap descending using sort.Slice
+		sort.Slice(sortedCoins, func(i, j int) bool {
+			return *sortedCoins[i].MarketCap > *sortedCoins[j].MarketCap
+		})
+		log.Printf("Returning %d coins sorted by market cap", len(sortedCoins))
+		return c.JSON(http.StatusOK, sortedCoins)
+	}
+}
+```
+
+Category filtering is pushed into the SQL query via `Joins` so the database
+does the work. The `filter` switch then sorts in Go memory — acceptable at
+this scale since the full coin list fits comfortably in RAM.
+
+### HandleWS — upgrading the connection
+
+```go
+func (cc *CryptoController) HandleWS(c echo.Context) error {
+	conn, err := websocket.Accept(c.Response().Writer, c.Request(), &websocket.AcceptOptions{
+		OriginPatterns: []string{"*"},
+	})
+	if err != nil {
+		return err
+	}
+
+	cc.hub.AddClient(conn)
+
+	defer func() {
+		cc.hub.RemoveClient(conn)
+		conn.Close(websocket.StatusNormalClosure, "Connection closed")
+	}()
+
+	ctx := c.Request().Context()
+	for {
+		_, _, err := conn.Read(ctx)
+		if err != nil {
+			break
+		}
+	}
+
+	return nil
+}
+```
+
+After upgrading the HTTP connection to WebSocket and registering it with the
+hub, the handler enters a read loop. The loop exists only to detect when the
+client disconnects — the `defer` then removes it from the hub cleanly.
+Incoming messages from the client are intentionally discarded; this is a
+server-to-client broadcast channel only.
+
+### AddToFavorites — toggle pattern
+
+```go
+func (cc *CryptoController) AddToFavorites(c echo.Context) error {
+	val := c.Get("user")
+	if val == nil {
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "Unauthorized"})
+	}
+	user, ok := val.(userModel.User)
+	if !ok {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Invalid user context"})
+	}
+
+	var req FavoriteRequest
+	if err := c.Bind(&req); err != nil {
+		log.Printf("Bind error: %v", err)
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "Invalid request format", "details": err.Error()})
+	}
+
+	log.Printf("Received coin_id: %d for user: %d", req.CoinID, user.ID)
+
+	if req.CoinID == 0 {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "coin_id is required and must be greater than 0"})
+	}
+
+	var coin models.Coin
+	if err := cc.db.First(&coin, req.CoinID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return c.JSON(http.StatusNotFound, echo.Map{"error": "Coin not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Database error"})
+	}
+
+	var count int64
+	cc.db.Table("user_favorites").Where("user_id = ? AND coin_id = ?", user.ID, coin.ID).Count(&count)
+
+	if count > 0 {
+		if err := cc.db.Model(&user).Association("Favorites").Delete(&coin); err != nil {
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Failed to remove favorite"})
+		}
+		return c.JSON(http.StatusOK, echo.Map{"message": "Removed from favorites", "isFavorite": false, "coinId": coin.ID})
+	}
+
+	if err := cc.db.Model(&user).Association("Favorites").Append(&coin); err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Failed to add favorite"})
+	}
+	return c.JSON(http.StatusOK, echo.Map{"message": "Added to favorites", "isFavorite": true, "coinId": coin.ID})
+}
+```
+
+A single endpoint handles both add and remove — the response includes
+`"isFavorite": true/false` so the frontend can update its UI state without
+a follow-up request.
+
+### GetFavorites — nested preload
+
+```go
+func (cc *CryptoController) GetFavorites(c echo.Context) error {
+	val := c.Get("user")
+	if val == nil {
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "Unauthorized"})
+	}
+	userContext := val.(userModel.User)
+
+	var user userModel.User
+	if err := cc.db.Preload("Favorites.Categories").First(&user, userContext.ID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return c.JSON(http.StatusNotFound, echo.Map{"error": "User not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Database error"})
+	}
+
+	return c.JSON(http.StatusOK, user.Favorites)
+}
+```
+
+`Preload("Favorites.Categories")` is GORM's dot-path notation for nested
+eager loading — it fetches the user's favorite coins and each coin's
+categories in two additional queries, avoiding the N+1 problem.
+
+## RegisterRoutes — wiring the whole module
+
+```go
+package crypto
+
+import (
+    "context"
+    "log"
+    "time"
+
+    "github.com/labstack/echo/v4"
+    "github.com/zshstacks/markdown-zsh/internal/infrastructure"
+    "github.com/zshstacks/markdown-zsh/internal/middleware"
+    "github.com/zshstacks/markdown-zsh/modules/crypto/controllers"
+    "github.com/zshstacks/markdown-zsh/modules/crypto/worker"
+    "gorm.io/gorm"
+)
+
+func RegisterRoutes(e *echo.Echo, db *gorm.DB, cfg infrastructure.AppConfig) {
+    hub := NewPriceHub()
+    ctx := context.Background()
+
+    go hub.Run(ctx)
+    go worker.StartBinanceStream(ctx, hub.Broadcast)
+    go worker.StartMarketCapSync(db)
+
+    mc := controllers.NewCryptoController(db, cfg, hub)
+
+    public := e.Group("/api/crypto")
+    {
+       public.GET("/market-stats", mc.GetMarketStats)
+       public.GET("/coins", mc.ListCoins)
+       public.GET("/categories", mc.ListCategories)
+       public.GET("/ws", mc.HandleWS)
+    }
+
+    go func() {
+       worker.FetchAndSyncCoins(db)
+       worker.SeedCategories(db)
+
+       for {
+          log.Println("Updating market stats...")
+          worker.SyncMarketStats(db)
+          time.Sleep(10 * time.Minute)
+       }
+    }()
+
+    private := e.Group("/api/crypto/user")
+    private.Use(middleware.RequireAuth(db, cfg))
+    {
+       private.POST("/favorites", mc.AddToFavorites)
+       private.GET("/favorites", mc.GetFavorites)
+    }
+}
+```
+
+The startup goroutine at the bottom runs `FetchAndSyncCoins` → `SeedCategories`
+in sequence before entering the 10-minute stats loop. This ordering guarantees
+coins exist before categories are assigned to them, and categories exist before
+the first stats sync runs.
+
+## API surface
+
+```
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/crypto/market-stats` | Public | Single-row global market stats |
+| `GET` | `/api/crypto/coins` | Public | All coins, optional `?filter=gainers\|new` + `?category=slug` |
+| `GET` | `/api/crypto/categories` | Public | All category records |
+| `GET` | `/api/crypto/ws` | Public | WebSocket upgrade — live ticker stream |
+| `POST` | `/api/crypto/user/favorites` | Auth | Toggle a coin in/out of favorites |
+| `GET` | `/api/crypto/user/favorites` | Auth | List user's favorite coins with categories |
+```

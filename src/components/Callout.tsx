@@ -8,24 +8,24 @@ interface CalloutProps {
 const CALLOUT_STYLES = {
   tip: {
     border: "border-[#81e6d9]/30",
-    bg: "bg-[#81e6d9]/6",
+    bg: "bg-[#81e6d9]/6 dark:bg-[#81e6d9]/16",
     icon: "💡",
     label: "Tip",
     labelColor: "text-[#81e6d9]",
   },
   warning: {
     border: "border-amber-400/30",
-    bg: "bg-amber-400/6",
+    bg: "bg-amber-400/6 dark:bg-amber-600/6",
     icon: "⚠️",
     label: "Warning",
-    labelColor: "text-amber-400",
+    labelColor: "text-amber-400 dark:text-amber-700",
   },
   note: {
     border: "border-white/15",
-    bg: "bg-white/4",
+    bg: "bg-white/4 dark:bg-amber-400/6",
     icon: "📌",
     label: "Note",
-    labelColor: "text-white/60",
+    labelColor: "text-white/60 dark:text-[#4b525b]",
   },
 };
 

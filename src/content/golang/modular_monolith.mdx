@@ -1,0 +1,734 @@
+---
+title: Modular Monolith in Go
+description: Structuring a Go backend as a Modular Monolith — one deployable binary, cleanly separated domain modules, shared infrastructure, and zero microservice overhead.
+tags: [golang, architecture, gin, echo, backend]
+readTime: 12
+date: 2025-04-10
+---
+
+## What is a Modular Monolith
+
+A Modular Monolith ships as a single binary but enforces strict internal
+boundaries between domains. Each module owns its own controllers, models, and
+routes. Shared concerns — database, config, email, middleware — live in a
+separate `infrastructure` layer that every module can import, but modules
+never import each other.
+
+You get the operational simplicity of a monolith with most of the isolation
+benefits of microservices. No network hops between domains, no distributed
+tracing required, and a `go build ./...` is still your entire deploy pipeline.
+
+<Callout type="tip">
+    This pattern is an excellent starting point for a product that *might* need
+    microservices later. Module boundaries map cleanly to future service cuts —
+    if you ever need them.
+</Callout>
+
+## Project structure
+
+This is the layout used in [SublimeHub](https://github.com/zshstacks/sublime-hub),
+a multi-module fullstack app:
+
+```
+server/
+├── cmd/
+│   └── api/
+│       └── main.go          ← entrypoint, wires everything together
+├── internal/
+│   ├── infrastructure/
+│   │   ├── templates/
+│   │   │   ├── reset_password.html
+│   │   │   └── verify_email.html
+│   │   ├── config.go        ← env vars, app config
+│   │   ├── db.go            ← database connection pool
+│   │   └── email.go         ← email service (SMTP / provider)
+│   ├── middleware/
+│   │   └── auth.go          ← JWT / session middleware
+│   └── modules/
+│       ├── crypto/
+│       │   ├── controllers/
+│       │   │   └── crypto.go
+│       │   ├── helpers/     ← helpers like generateOTP
+│       │   ├── models/
+│       │   │   ├── category.go
+│       │   │   ├── coin.go
+│       │   │   └── marketStats.go
+│       │   └── worker/
+|       |   ├── hub.go   ← WebSocket hub
+│       │   └── routes.go
+│       ├── monitor/
+│       └── users/
+│
+├── .env
+└── go.mod
+```
+
+The three layers are:
+
+- **`cmd/api`** — thin entrypoint. Reads config, opens DB, mounts all module
+routes, starts the server. Nothing else lives here.
+- **`internal/infrastructure`** — shared primitives every module depends on:
+DB pool, config struct, mailer.
+- **`internal/modules/*`** — self-contained domain slices. Each one registers
+its own routes and never reaches into a sibling module.
+
+## Infrastructure layer
+
+### Config
+
+All environment variables are parsed once at startup into a single struct.
+Every module receives what it needs through constructor injection — no
+`os.Getenv` scattered throughout business logic.
+
+```go
+// internal/infrastructure/config.go
+package infrastructure
+
+import (
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/joho/godotenv"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+)
+
+type AppConfig struct {
+	Environment string
+	Email       EmailConfig
+	OAuth       OAuthConfig
+	Server      ServerConfig
+	Database    DatabaseConfig
+	Cookie      CookieConfig
+	JWT         JWTConfig
+	CORS        CORSConfig
+}
+
+type EmailConfig struct {
+	Host     string
+	Password string
+	Port     int
+	From     string
+	Username string
+}
+
+type OAuthConfig struct {
+	GoogleClientID     string
+	GoogleClientSecret string
+}
+
+type ServerConfig struct {
+	Port         string
+	ReadTimeout  int
+	WriteTimeout int
+	Debug        bool
+}
+
+type DatabaseConfig struct {
+	Host            string
+	Port            string
+	User            string
+	Password        string
+	Name            string
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime int
+}
+
+type CookieConfig struct {
+	Secure   bool
+	SameSite http.SameSite
+}
+
+type JWTConfig struct {
+	Secret          string
+	AccessTokenTTL  int //minute
+	RefreshTokenTTL int //day
+}
+
+type CORSConfig struct {
+	AllowedOrigins []string
+	AllowedMethods []string
+	AllowedHeaders []string
+}
+
+// LoadConfig loads .env and returns the AppConfig struct
+func LoadConfig() AppConfig {
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("Warning: .env file not found, using system environment variables")
+	}
+
+	env := getEnv("APP_ENV", "development")
+	isProd := strings.ToLower(env) == "production"
+
+	return AppConfig{
+		Environment: env,
+
+		Server: ServerConfig{
+			Port:         getEnv("PORT", "8000"),
+			ReadTimeout:  getEnvAsInt("READ_TIMEOUT", 10),
+			WriteTimeout: getEnvAsInt("WRITE_TIMEOUT", 10),
+			Debug:        !isProd,
+		},
+
+		Email: EmailConfig{
+			Port:     getEnvAsInt("SMTP_PORT", 587),
+			Username: getEnv("SMTP_USERNAME", ""),
+			Password: getEnv("SMTP_PASS", ""),
+			From:     getEnv("SMTP_FROM", ""),
+			Host:     getEnv("SMTP_HOST", ""),
+		},
+
+		OAuth: OAuthConfig{
+			GoogleClientID:     getEnv("GOOGLE_CLIENT_ID", ""),
+			GoogleClientSecret: getEnv("GOOGLE_CLIENT_SECRET", ""),
+		},
+
+		Database: DatabaseConfig{
+			Host:            getEnv("DB_HOST", "localhost"),
+			Port:            getEnv("DB_PORT", "5432"),
+			User:            getEnv("DB_USER", "postgres"),
+			Password:        getEnv("DB_PASSWORD", "postgres"),
+			Name:            getEnv("DB_NAME", "sublime_hub"),
+			MaxOpenConns:    getEnvAsInt("DB_MAX_OPEN_CONNS", 25),
+			MaxIdleConns:    getEnvAsInt("DB_MAX_IDLE_CONNS", 5),
+			ConnMaxLifetime: getEnvAsInt("DB_CONN_MAX_LIFETIME", 300),
+		},
+
+		Cookie: CookieConfig{
+			Secure:   isProd,
+			SameSite: getSameSite(isProd),
+		},
+
+		JWT: JWTConfig{
+			Secret:          getEnv("JWT_SECRET", "secret-key"),
+			AccessTokenTTL:  getEnvAsInt("JWT_ACCESS_TTL", 15),
+			RefreshTokenTTL: getEnvAsInt("JWT_REFRESH_TTL", 7),
+		},
+
+		CORS: CORSConfig{
+			AllowedOrigins: getCORSOrigins(isProd),
+			AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+			AllowedHeaders: []string{"Origin", "Content-Type", "Authorization"},
+		},
+	}
+}
+
+// Helpers
+func getEnv(key, defaultVal string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultVal
+}
+
+func getEnvAsInt(key string, defaultVal int) int {
+	if value := os.Getenv(key); value != "" {
+		if intVal, err := strconv.Atoi(value); err == nil {
+			return intVal
+		}
+	}
+	return defaultVal
+}
+
+func getSameSite(isProd bool) http.SameSite {
+	if isProd {
+		return http.SameSiteStrictMode
+	}
+	return http.SameSiteLaxMode
+}
+
+func getCORSOrigins(isProd bool) []string {
+	if isProd {
+		origins := os.Getenv("CORS_ORIGINS")
+		if origins != "" {
+			return strings.Split(origins, ",")
+		}
+		return []string{"https://yourdomain.com"}
+	}
+	return []string{"http://localhost:3000", "http://localhost:8000"}
+}
+
+func (c *AppConfig) GetGoogleConfig() *oauth2.Config {
+	return &oauth2.Config{
+		ClientID:     c.OAuth.GoogleClientID,
+		ClientSecret: c.OAuth.GoogleClientSecret,
+		RedirectURL:  "http://localhost:8000/auth/oauth/google",
+		Endpoint:     google.Endpoint,
+		Scopes: []string{
+			"https://www.googleapis.com/auth/userinfo.email",
+			"https://www.googleapis.com/auth/userinfo.profile",
+		},
+	}
+}
+```
+
+### Database
+
+The DB connection is opened once in infrastructure and passed as a dependency.
+GORM manages the underlying connection pool — `ConnectToDB` returns a single
+`*gorm.DB` that every module shares. `SyncDatabase` runs `AutoMigrate` on
+startup so all models stay in sync with the schema.
+
+```go
+// internal/infrastructure/db.go
+package infrastructure
+
+import (
+	"fmt"
+	"log"
+
+	modelsCrypto "github.com/zshstacks/markdown-zsh/modules/crypto/models"
+	modelsMonitor "github.com/zshstacks/markdown-zsh/modules/monitor/models"
+	"github.com/zshstacks/markdown-zsh/modules/users/models"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+)
+
+func ConnectToDB(cfg AppConfig) *gorm.DB {
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable TimeZone=Europe/Riga",
+		cfg.Database.Host,
+		cfg.Database.User,
+		cfg.Database.Password,
+		cfg.Database.Name,
+		cfg.Database.Port,
+	)
+
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		panic(fmt.Sprintf("Failed to connect to database: %v", err))
+	}
+
+	log.Println("Connected to database successfully")
+	return db
+}
+
+func SyncDatabase(db *gorm.DB) {
+
+	err := db.AutoMigrate(
+		&models.User{},
+		&models.RefreshToken{},
+		&modelsMonitor.Monitor{},
+		&modelsMonitor.Heartbeat{},
+		&modelsCrypto.Coin{},
+		&modelsCrypto.Category{},
+		&modelsCrypto.MarketStats{},
+	)
+
+	if err != nil {
+		log.Fatalf("Database migration error: %v", err)
+	} else {
+		log.Println("Database migrated successfully!")
+	}
+}
+```
+
+<Callout type="note">
+    `SyncDatabase` is called once on startup. It's safe for development but for
+    production consider running migrations as a separate step with a tool like
+    `golang-migrate` to keep schema changes explicit and reversible.
+</Callout>
+
+## Module anatomy
+
+Every module follows the same internal shape:
+
+```
+modules/users/
+├── models/       ← GORM structs + query helpers
+├── controllers/  ← request parsing, calling helpers, writing responses
+├── helpers/      ← business logic (validation, hashing, JWT generation)
+└── routes.go     ← registers all routes for this module
+```
+
+### Models
+
+Models hold GORM struct definitions with field tags that drive both
+`AutoMigrate` and JSON serialisation. Keeping all `gorm.Model` embedding and
+relation declarations here means controllers never reach the DB directly.
+
+```go
+// modules/users/models/user.go
+package models
+
+import (
+	"time"
+
+	"github.com/zshstacks/markdown-zsh/modules/crypto/models"
+	"gorm.io/gorm"
+)
+
+const (
+	AuthProviderLocal  string = "local"
+	AuthProviderGoogle string = "google"
+)
+
+type User struct {
+	gorm.Model
+	UniqueID                   string `gorm:"uniqueIndex;size:12;not null" json:"uniqueID"`
+	Email                      string `gorm:"uniqueIndex;size:40;not null" json:"email"`
+	Username                   string `gorm:"size:30" json:"username"`
+	Password                   string `json:"-"`
+	OAuthProvider              string `gorm:"default:'local'"`
+	OAuthProviderID            string `gorm:"index"`
+	IsEmailConfirmed           bool   `gorm:"default:false"`
+	EmailConfirmationCode      string `gorm:"size:64" json:"-"`
+	ConfirmationCodeExpiresAt  time.Time
+	PasswordResetCode          string `gorm:"size:64" json:"-"`
+	PasswordResetCodeExpiresAt time.Time
+
+	Favorites []models.Coin `gorm:"many2many:user_favorites;" json:"favorites"`
+}
+```
+
+### Helpers
+
+Helpers contain business logic that doesn't belong in a controller — things
+like OTP generation, password hashing, or token creation.
+
+```go
+// modules/users/helpers/emailCode.go
+package helpers
+
+import (
+	"crypto/rand"
+)
+
+const otpChars = "1234567890"
+
+func GenerateOTP(length int) (string, error) {
+	buffer := make([]byte, length)
+	_, err := rand.Read(buffer)
+	if err != nil {
+		return "", err
+	}
+
+	otpCharsLength := len(otpChars)
+	for i := 0; i < length; i++ {
+		buffer[i] = otpChars[int(buffer[i])%otpCharsLength]
+	}
+
+	return string(buffer), nil
+}
+```
+
+### Controllers
+
+Controllers are thin. They parse the request, call helpers, and write the
+response. No direct DB queries, no business logic.
+
+```go
+// modules/users/controllers/auth.go
+package controllers
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
+	"github.com/zshstacks/markdown-zsh/internal/infrastructure"
+	"github.com/zshstacks/markdown-zsh/modules/users/helpers"
+	"github.com/zshstacks/markdown-zsh/modules/users/models"
+	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
+)
+
+type AuthController struct {
+	DB  *gorm.DB
+	Cfg infrastructure.AppConfig
+}
+
+func NewAuthController(db *gorm.DB, cfg infrastructure.AppConfig) *AuthController {
+	return &AuthController{DB: db, Cfg: cfg}
+}
+
+func (ac *AuthController) VerifyEmail(c echo.Context) error {
+	var body struct {
+		Email string `json:"email"`
+		Code  string `json:"code"`
+	}
+
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Failed to read body")
+	}
+
+	user, err := helpers.FindUserByEmail(ac.DB, body.Email)
+	if err != nil || user.ID == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "No user with that email exists")
+	}
+
+	if user.EmailConfirmationCode != body.Code {
+		return echo.NewHTTPError(http.StatusBadRequest, "Code does not match")
+	}
+
+	if time.Now().After(user.ConfirmationCodeExpiresAt) {
+		return echo.NewHTTPError(http.StatusBadRequest, "User confirmation code expired")
+	}
+
+	user.IsEmailConfirmed = true
+	user.EmailConfirmationCode = ""
+	user.ConfirmationCodeExpiresAt = time.Time{}
+
+	ac.DB.Save(&user)
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "Email verified"})
+
+}
+
+func (ac *AuthController) Login(c echo.Context) error {
+	var body struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Failed to read body")
+	}
+
+	user, err := helpers.FindUserByEmail(ac.DB, body.Email)
+	if err != nil || user.ID == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "Invalid email or password")
+	}
+
+	if user.IsEmailConfirmed == false {
+		return echo.NewHTTPError(http.StatusForbidden, "Your email is not confirmed")
+	}
+
+	if user.OAuthProvider != models.AuthProviderLocal {
+		return echo.NewHTTPError(http.StatusBadRequest, "Please use social login for this account")
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(body.Password)); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Invalid email or password")
+	}
+
+	return ac.finalizeSession(c, user)
+}
+```
+
+### Routes
+
+Each module exposes a single `RegisterRoutes` function. The entrypoint calls
+it — this is the only coupling between `cmd/api` and any module.
+
+```go
+// modules/users/routes.go
+package users
+
+import (
+	"github.com/labstack/echo/v4"
+	"github.com/zshstacks/markdown-zsh/internal/infrastructure"
+	"github.com/zshstacks/markdown-zsh/internal/middleware"
+	"github.com/zshstacks/markdown-zsh/modules/users/controllers"
+	"gorm.io/gorm"
+)
+
+func RegisterRoutes(e *echo.Echo, db *gorm.DB, cfg infrastructure.AppConfig) {
+
+	authController := controllers.NewAuthController(db, cfg)
+
+	public := e.Group("/")
+	{
+		public.POST("register", authController.Register)
+		public.POST("login", authController.Login)
+		public.POST("auth/refresh", authController.Refresh)
+		public.POST("auth/refresh/logout", authController.Logout)
+		public.POST("auth/verify-email", authController.VerifyEmail)
+		public.POST("auth/resend-otp", authController.ResendOTP)
+		public.POST("auth/reset", authController.ForgotPassword)
+		public.POST("auth/reset/new", authController.ResetPassword)
+		public.GET("auth/google", authController.GoogleLogin)
+		public.GET("auth/oauth/google", authController.GoogleCallback)
+	}
+
+	private := e.Group("/user")
+
+	private.Use(middleware.RequireAuth(db, cfg))
+	{
+		private.GET("/current", authController.GetCurrentUser)
+		private.DELETE("/current/delete", authController.DeleteUser)
+		private.PUT("/current/change-username", authController.ChangeUsername)
+	}
+}
+```
+
+## Real-time module — the crypto worker
+
+The `crypto` module adds a WebSocket hub for live price updates. The worker
+sits alongside controllers and models without polluting any other module.
+
+```go
+// modules/crypto/hub.go
+package crypto
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/coder/websocket"
+)
+
+type PriceHub struct {
+	clients    map[*websocket.Conn]struct{}
+	register   chan *websocket.Conn
+	unregister chan *websocket.Conn
+	mu         sync.RWMutex
+	Broadcast  chan []byte
+}
+
+func NewPriceHub() *PriceHub {
+	return &PriceHub{
+		clients:    make(map[*websocket.Conn]struct{}),
+		register:   make(chan *websocket.Conn),
+		unregister: make(chan *websocket.Conn),
+		Broadcast:  make(chan []byte, 100),
+	}
+}
+
+func (h *PriceHub) AddClient(conn *websocket.Conn) {
+	h.register <- conn
+}
+
+func (h *PriceHub) RemoveClient(conn *websocket.Conn) {
+	h.unregister <- conn
+}
+
+func (h *PriceHub) Run(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case conn := <-h.register:
+			h.mu.Lock()
+			h.clients[conn] = struct{}{}
+			h.mu.Unlock()
+		case conn := <-h.unregister:
+			h.mu.Lock()
+			delete(h.clients, conn)
+			h.mu.Unlock()
+		case msg := <-h.Broadcast:
+			h.mu.RLock()
+			for client := range h.clients {
+
+				go func(c *websocket.Conn, m []byte) {
+					writeCtx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+					defer cancel()
+					c.Write(writeCtx, websocket.MessageText, m)
+				}(client, msg)
+			}
+			h.mu.RUnlock()
+		}
+	}
+}
+```
+
+<Callout type="tip">
+    The hub is created once in `main.go` and injected into the crypto controller
+    just like the DB. No global state, easy to test with a fake hub in unit tests.
+</Callout>
+
+## Wiring it all together in main.go
+
+The entrypoint is the only place that knows all the modules exist. It creates
+shared dependencies and hands them to each module's `RegisterRoutes`.
+
+```go
+// cmd/api/main.go
+package main
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/go-playground/validator/v10"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/zshstacks/markdown-zsh/internal/infrastructure"
+	"github.com/zshstacks/markdown-zsh/modules/crypto"
+	"github.com/zshstacks/markdown-zsh/modules/monitor"
+	"github.com/zshstacks/markdown-zsh/modules/monitor/controllers"
+	"github.com/zshstacks/markdown-zsh/modules/users"
+	"gorm.io/gorm"
+)
+
+func main() {
+
+	cfg := infrastructure.LoadConfig()
+
+	db := infrastructure.ConnectToDB(cfg)
+	infrastructure.SyncDatabase(db)
+
+	e := echo.New()
+	e.Use(middleware.Recover())
+	e.Use(middleware.Logger())
+	e.Use(middleware.Secure())
+
+	e.Validator = &controllers.CustomValidator{Validator: validator.New()}
+
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins:     cfg.CORS.AllowedOrigins,
+		AllowMethods:     cfg.CORS.AllowedMethods,
+		AllowHeaders:     cfg.CORS.AllowedHeaders,
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+		MaxAge:           int((24 * time.Hour) / time.Millisecond),
+	}))
+
+	registerModules(e, db, cfg)
+
+	e.Server.ReadTimeout = time.Duration(cfg.Server.ReadTimeout) * time.Second
+	e.Server.WriteTimeout = time.Duration(cfg.Server.WriteTimeout) * time.Second
+
+	port := fmt.Sprintf(":%s", cfg.Server.Port)
+	e.Logger.Fatal(e.Start(port))
+}
+
+func registerModules(e *echo.Echo, db *gorm.DB, cfg infrastructure.AppConfig) {
+	users.RegisterRoutes(e, db, cfg)
+
+	monitor.RegisterRoutes(e, db, cfg)
+
+	crypto.RegisterRoutes(e, db, cfg)
+}
+```
+
+<Callout type="warning">
+    Modules must never import each other. If `crypto` needs user data, it should
+    either duplicate the minimal query it needs or extract a shared interface into
+    `infrastructure`. Cross-module imports are the smell that warns you a boundary
+    is wrong.
+</Callout>
+
+## Adding a new module
+
+The workflow is always the same:
+
+1. Create `internal/modules/yourmodule/`
+2. Add `models/`, `controllers/`, `helpers/`, `routes.go`
+3. Register the GORM structs in `infrastructure.SyncDatabase`
+4. Call `yourmodule.RegisterRoutes(e, db, cfg)` in `registerModules`
+
+Nothing else changes. Existing modules are completely unaffected.
+
+## When to move to microservices
+
+A modular monolith is not a stepping stone you're obligated to leave. Consider
+splitting only when a specific module has genuinely different scaling
+characteristics (e.g., the crypto worker needs 10x more CPU than the users
+service) or when separate teams need independent deployment pipelines.
+
+Because each module is already isolated, the extraction is straightforward:
+move the folder, wrap it in its own `cmd/`, expose an HTTP or gRPC API, and
+update the caller. The internal logic stays exactly the same.

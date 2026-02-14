@@ -1,0 +1,640 @@
+---
+title: Email Verification & Password Reset in Go
+description: OTP-based email verification and password reset from scratch — SMTP with Go's standard library, embedded HTML templates, secure 6-digit codes, and token revocation on password change.
+tags: [golang, echo, gorm, smtp, auth, email]
+readTime: 13
+date: 2025-04-25
+---
+
+## The full flow at a glance
+
+Two features share the same underlying mechanism: generate a short-lived
+numeric code, store it on the user record, send it by email, then verify it
+in a follow-up request. The difference is what happens after a successful
+verification — confirming an email sets a flag, resetting a password hashes
+the new value and revokes all active sessions.
+
+```
+Register  →  generate OTP  →  send verify_email.html  →  POST /auth/verify-email
+ForgotPw  →  generate OTP  →  send reset_password.html →  POST /auth/reset/new  →  revoke all refresh tokens
+```
+
+## Project structure
+
+The users module lives in `internal/modules/users/` and splits responsibilities
+across three sub-packages:
+
+```
+modules/users/
+├── controllers/
+│   └── auth.go              ← all HTTP handlers
+├── helpers/
+│   ├── emailCode.go         ← OTP generation
+│   ├── findUserByEmail.go   ← shared DB query
+│   ├── generateRandomString.go
+│   ├── id.go                ← unique ID generation
+│   ├── signJwt.go
+│   ├── tryRefresh.go
+│   └── verifyAccessToken.go
+└── models/
+    ├── user.go
+    └── refresh_token.go
+```
+
+Email templates and the SMTP sender are infrastructure-level concerns, shared
+across modules:
+
+```
+internal/infrastructure/
+├── templates/
+│   ├── verify_email.html
+│   └── reset_password.html
+└── email.go
+```
+
+## User model — the relevant fields
+
+Both flows write directly to fields on the `User` struct. No separate
+verification table needed.
+
+```go
+package models
+
+import (
+    "time"
+
+    "github.com/zshstacks/markdown-zsh/modules/crypto/models"
+    "gorm.io/gorm"
+)
+
+const (
+    AuthProviderLocal  string = "local"
+    AuthProviderGoogle string = "google"
+)
+
+type User struct {
+    gorm.Model
+    UniqueID                   string `gorm:"uniqueIndex;size:12;not null" json:"uniqueID"`
+    Email                      string `gorm:"uniqueIndex;size:40;not null" json:"email"`
+    Username                   string `gorm:"size:30" json:"username"`
+    Password                   string `json:"-"`
+    OAuthProvider              string `gorm:"default:'local'"`
+    OAuthProviderID            string `gorm:"index"`
+    IsEmailConfirmed           bool   `gorm:"default:false"`
+    EmailConfirmationCode      string `gorm:"size:64" json:"-"`
+    ConfirmationCodeExpiresAt  time.Time
+    PasswordResetCode          string `gorm:"size:64" json:"-"`
+    PasswordResetCodeExpiresAt time.Time
+
+    Favorites []models.Coin `gorm:"many2many:user_favorites;" json:"favorites"`
+}
+```
+
+Four fields drive the two flows:
+
+- `EmailConfirmationCode` + `ConfirmationCodeExpiresAt` — for registration verification and OTP resend
+- `PasswordResetCode` + `PasswordResetCodeExpiresAt` — for the forgot-password flow
+
+Both code fields have `json:"-"` so they are never serialised into any API
+response regardless of which handler returns the user object.
+
+<Callout type="note">
+    Storing the OTP in plain text on the user record is fine for short-lived
+    numeric codes — the 15-minute window is narrow and brute-forcing a 6-digit
+    code against a rate-limited endpoint is impractical. If you needed longer
+    expiry or higher security, you would store a bcrypt hash of the code instead.
+</Callout>
+
+## OTP generation
+
+```go
+package helpers
+
+import (
+    "crypto/rand"
+)
+
+const otpChars = "1234567890"
+
+func GenerateOTP(length int) (string, error) {
+    buffer := make([]byte, length)
+    _, err := rand.Read(buffer)
+    if err != nil {
+       return "", err
+    }
+
+    otpCharsLength := len(otpChars)
+    for i := 0; i < length; i++ {
+       buffer[i] = otpChars[int(buffer[i])%otpCharsLength]
+    }
+
+    return string(buffer), nil
+}
+```
+
+`crypto/rand` fills the buffer with cryptographically secure random bytes. Each
+byte is then mapped to a digit by taking it modulo 10. The result is a 6-digit
+string like `"482019"` — numeric-only so it's easy to type from a phone.
+
+<Callout type="tip">
+    Using `crypto/rand` instead of `math/rand` is important here. `math/rand`
+    is seeded deterministically and its output is predictable if an attacker knows
+    the seed time. `crypto/rand` reads from the OS entropy pool and is safe for
+    security-sensitive values.
+</Callout>
+
+## Email infrastructure
+
+### SMTP sender
+
+```go
+package infrastructure
+
+import (
+    "bytes"
+    "embed"
+    "fmt"
+    "html/template"
+    "net/smtp"
+)
+
+//go:embed templates/*
+var emailTemplates embed.FS
+
+func SendEmail(cfg AppConfig, to string, subject string, body string) error {
+    addr := fmt.Sprintf("%s:%d", cfg.Email.Host, cfg.Email.Port)
+
+    auth := smtp.PlainAuth("", cfg.Email.Username, cfg.Email.Password, cfg.Email.Host)
+
+    header := fmt.Sprintf("From: %s\r\n"+
+       "To: %s\r\n"+
+       "Subject: %s\r\n"+
+       "MIME-Version: 1.0\r\n"+
+       "Content-Type: text/html; charset=UTF-8\r\n"+
+       "\r\n", cfg.Email.From, to, subject)
+
+    msg := []byte(header + body)
+
+    err := smtp.SendMail(addr, auth, cfg.Email.Username, []string{to}, msg)
+    if err != nil {
+       return err
+    }
+
+    return nil
+}
+
+func ParseTemplate(code string, templateName string) (string, error) {
+    t, err := template.ParseFS(emailTemplates, templateName)
+    if err != nil {
+       return "", err
+    }
+
+    var body bytes.Buffer
+
+    //anonym struct with code field
+    data := struct {
+       Code string
+    }{
+       Code: code,
+    }
+
+    err = t.Execute(&body, data)
+    if err != nil {
+       return "", err
+    }
+
+    return body.String(), nil
+}
+```
+
+`//go:embed templates/*` bakes the HTML files into the compiled binary at build
+time. There is no runtime filesystem dependency — the templates are always
+present even in a Docker scratch image with no filesystem mounted.
+
+`ParseTemplate` renders the template into a `bytes.Buffer` using an anonymous
+struct as the data context. The only placeholder used in both templates is
+`{{.Code}}`, so the struct only needs that one field.
+
+<Callout type="note">
+    `smtp.PlainAuth` transmits credentials in plaintext, but `smtp.SendMail`
+    upgrades the connection to TLS via STARTTLS before authentication. With
+    `smtp.gmail.com:587` this is the standard handshake Gmail expects.
+</Callout>
+
+### SMTP config in `.env`
+
+```bash
+SMTP_PASS=your_password
+SMTP_USERNAME=your_email
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_FROM=your_from
+```
+
+These map to `EmailConfig` fields loaded by `LoadConfig()` at startup. The
+`From` address is what appears in the recipient's inbox — it can differ from
+`Username` if your mail provider allows sender aliases.
+
+### Email templates
+
+Both templates follow the same table-based layout. `{{.Code}}` is the only
+dynamic value — the rest is static HTML.
+
+**verify_email.html:**
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Confirm your email</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
+<table width="100%" border="0" cellspacing="0" cellpadding="0">
+    <tr>
+        <td align="center" style="padding: 20px 0;">
+            <table width="600" border="0" cellspacing="0" cellpadding="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+                <tr>
+                    <td align="center" style="padding: 40px 0; background-color: #121F2B; color: #ffffff;">
+                        <h1 style="margin: 0; font-size: 24px;">Sublime Hub</h1>
+                    </td>
+                </tr>
+                <tr>
+                    <td style="padding: 40px 30px;">
+                        <h2 style="margin: 0 0 20px; color: #333333; font-size: 20px;">Hello!</h2>
+                        <p style="margin: 0 0 20px; color: #666666; line-height: 1.5;">
+                            Thank you for registering with Sublime Hub. To complete your registration, please use this 6-digit code:
+                        </p>
+                        <div style="text-align: center; padding: 20px; background-color: #f8f9fa; border-radius: 4px; border: 1px dashed #cccccc;">
+                            <span style="font-size: 32px; font-weight: bold; letter-spacing: 5px; color: #000000;">{{.Code}}</span>
+                        </div>
+                        <p style="margin: 20px 0 0; color: #999999; font-size: 14px; line-height: 1.5;">
+                            This code will be valid for <strong>15 minutes</strong>. If you did not request this code, please ignore this email.
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <td align="center" style="padding: 20px; background-color: #eeeeee; color: #999999; font-size: 12px;">
+                        &copy; 2025 Sublime Hub. All rights reserved.
+                    </td>
+                </tr>
+            </table>
+        </td>
+    </tr>
+</table>
+</body>
+</html>
+```
+
+**reset_password.html** follows the identical layout with different copy —
+"Reset your password" as the title and the reset-specific paragraph text. The
+`{{.Code}}` slot works the same way.
+
+## Registration — generating and sending the code
+
+```go
+func (ac *AuthController) Register(c echo.Context) error {
+	var body struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		Username string `json:"username"`
+	}
+
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Failed to read body")
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(body.Password), 12)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to hash password")
+	}
+
+	user := models.User{
+		Email:    body.Email,
+		Password: string(hash),
+		Username: body.Username,
+	}
+
+	otp, err := helpers.GenerateOTP(6)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to generate otp")
+	}
+	user.EmailConfirmationCode = otp
+	user.ConfirmationCodeExpiresAt = time.Now().Add(15 * time.Minute)
+
+	const maxAttempts = 5
+	var created bool
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		u, err := helpers.GenerateUniqueID(12)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to generate unique id")
+		}
+		user.UniqueID = u
+
+		// Use ac.DB
+		if err := ac.DB.Create(&user).Error; err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "duplicate") || strings.Contains(strings.ToLower(err.Error()), "unique") {
+				if attempt == maxAttempts {
+					return echo.NewHTTPError(http.StatusInternalServerError, "failed to create user due to id collision")
+				}
+				continue
+			}
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to create user")
+		}
+		created = true
+		break
+	}
+
+	if !created {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to create user")
+	}
+
+	go func(email, code string) {
+		htmlBody, err := infrastructure.ParseTemplate(code, "templates/verify_email.html")
+		if err != nil {
+			log.Printf("Template error: %v", err)
+			return
+		}
+		err = infrastructure.SendEmail(ac.Cfg, email, "Your new confirmation code", htmlBody)
+		if err != nil {
+			log.Printf("Email error: %v", err)
+		}
+
+	}(user.Email, otp)
+
+	resp := struct {
+		ID        uint      `json:"id"`
+		UniqueID  string    `json:"unique_id"`
+		Email     string    `json:"email"`
+		Username  string    `json:"username"`
+		CreatedAt time.Time `json:"created_at"`
+	}{
+		ID:        user.ID,
+		UniqueID:  user.UniqueID,
+		Email:     user.Email,
+		Username:  user.Username,
+		CreatedAt: user.CreatedAt,
+	}
+
+	return c.JSON(http.StatusOK, resp)
+}
+```
+
+A few things worth noting here. The OTP and its expiry are set on the struct
+before the DB insert, so they land in the same transaction as the user row —
+no separate update needed. The email is sent in a goroutine so SMTP latency
+doesn't block the HTTP response. The `UniqueID` collision retry loop handles
+the astronomically unlikely case that a randomly generated 12-character ID
+already exists in the database.
+
+<Callout type="tip">
+    The response struct is defined inline and only exposes safe fields. Returning
+    the GORM model directly would include `Password` (even though it's `json:"-"`,
+    it's cleaner to be explicit) and all the OTP fields. An anonymous response
+    struct makes the API contract obvious at a glance.
+</Callout>
+
+## Verifying the email
+
+```go
+func (ac *AuthController) VerifyEmail(c echo.Context) error {
+	var body struct {
+		Email string `json:"email"`
+		Code  string `json:"code"`
+	}
+
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Failed to read body")
+	}
+
+	user, err := helpers.FindUserByEmail(ac.DB, body.Email)
+	if err != nil || user.ID == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "No user with that email exists")
+	}
+
+	if user.EmailConfirmationCode != body.Code {
+		return echo.NewHTTPError(http.StatusBadRequest, "Code does not match")
+	}
+
+	if time.Now().After(user.ConfirmationCodeExpiresAt) {
+		return echo.NewHTTPError(http.StatusBadRequest, "User confirmation code expired")
+	}
+
+	user.IsEmailConfirmed = true
+	user.EmailConfirmationCode = ""
+	user.ConfirmationCodeExpiresAt = time.Time{}
+
+	ac.DB.Save(&user)
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "Email verified"})
+
+}
+```
+
+After a successful match, the code and expiry are zeroed out so the same
+OTP can never be used again — even if it's still within the 15-minute window.
+`time.Time{}` is the zero value, which GORM writes as a null timestamp.
+
+## Resending the OTP
+
+```go
+func (ac *AuthController) ResendOTP(c echo.Context) error {
+	var body struct {
+		Email string `json:"email"`
+	}
+
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Failed to read body")
+	}
+
+	user, err := helpers.FindUserByEmail(ac.DB, body.Email)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "No user with that email exists")
+	}
+
+	if user.IsEmailConfirmed == true {
+		return echo.NewHTTPError(http.StatusBadRequest, "You already confirmed your email")
+	}
+
+	otp, err := helpers.GenerateOTP(6)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to generate OTP")
+	}
+
+	user.EmailConfirmationCode = otp
+	user.ConfirmationCodeExpiresAt = time.Now().Add(15 * time.Minute)
+
+	ac.DB.Save(&user)
+
+	go func(email, code string) {
+		log.Printf("Trying to sent new Email OTP to: %s", email)
+
+		htmlBody, err := infrastructure.ParseTemplate(code, "templates/verify_email.html")
+		if err != nil {
+			log.Printf("Template error ResendOTP: %v", err)
+			return
+		}
+
+		err = infrastructure.SendEmail(ac.Cfg, email, "Your new confirmation code", htmlBody)
+		if err != nil {
+			log.Printf("SMTP error ResendOTP: %v", err)
+		} else {
+			log.Printf("Email successfully sent to %s", email)
+		}
+	}(user.Email, otp)
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "Successfully sent confirmation code"})
+}
+```
+
+Saving the new OTP overwrites the old one, so calling this endpoint
+invalidates any previously issued code. The already-confirmed guard prevents
+spamming the endpoint after verification is complete.
+
+## Forgot password — issuing the reset code
+
+```go
+func (ac *AuthController) ForgotPassword(c echo.Context) error {
+	var body struct {
+		Email string `json:"email"`
+	}
+
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Failed to read body")
+	}
+
+	user, err := helpers.FindUserByEmail(ac.DB, body.Email)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "No user with that email exists")
+	}
+
+	otp, err := helpers.GenerateOTP(6)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to generate OTP")
+	}
+
+	user.PasswordResetCode = otp
+	user.PasswordResetCodeExpiresAt = time.Now().Add(15 * time.Minute)
+
+	ac.DB.Save(&user)
+
+	go func(email, code string) {
+		log.Printf("Trying to sent new Email OTP to: %s", email)
+
+		htmlBody, err := infrastructure.ParseTemplate(code, "templates/reset_password.html")
+		if err != nil {
+			log.Printf("Template error ResendOTP: %v", err)
+		}
+
+		err = infrastructure.SendEmail(ac.Cfg, email, "Your new reset password code", htmlBody)
+		if err != nil {
+			log.Printf("SMTP error ResendOTP: %v", err)
+		} else {
+			log.Printf("Email successfully sent to %s", email)
+		}
+
+	}(user.Email, otp)
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "Successfully sent reset password"})
+
+}
+```
+
+This uses `PasswordResetCode` and `reset_password.html` instead of the
+confirmation equivalents, but the pattern is identical to `ResendOTP`. The
+separation into two distinct field pairs on the model means a reset code
+can never accidentally verify an email, and vice versa.
+
+## Resetting the password — and revoking all sessions
+
+```go
+func (ac *AuthController) ResetPassword(c echo.Context) error {
+	var body struct {
+		Email       string `json:"email"`
+		Code        string `json:"code"`
+		NewPassword string `json:"new_password"`
+	}
+
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Failed to read body")
+	}
+
+	if body.Email == "" || body.Code == "" || body.NewPassword == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "All fields (email, code, new_password) are required")
+	}
+
+	user, err := helpers.FindUserByEmail(ac.DB, body.Email)
+	if err != nil || user.ID == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "User not found")
+	}
+
+	if user.PasswordResetCode == "" || user.PasswordResetCode != body.Code {
+		return echo.NewHTTPError(http.StatusBadRequest, "Invalid or already used reset code")
+	}
+
+	if time.Now().After(user.PasswordResetCodeExpiresAt) {
+		return echo.NewHTTPError(http.StatusBadRequest, "Reset code expired")
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(body.NewPassword), 12)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Error processing password")
+	}
+
+	user.Password = string(hash)
+	user.PasswordResetCode = ""
+	user.PasswordResetCodeExpiresAt = time.Time{}
+
+	if err := ac.DB.Save(&user).Error; err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to update user")
+	}
+
+	//soft revoke
+	now := time.Now()
+	err = ac.DB.Model(&models.RefreshToken{}).
+		Where("user_id = ? AND revoked_at IS NULL", user.ID).
+		Updates(map[string]interface{}{
+			"revoked_at": &now,
+		}).Error
+
+	if err != nil {
+		log.Printf("Failed to revoke tokens: %v", err)
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{
+		"message": "Password updated successfully. All previous sessions have been logged out.",
+	})
+}
+```
+
+After hashing and saving the new password, all non-revoked refresh tokens for
+that user are soft-revoked by setting `revoked_at` to the current time. This
+is the "log out everywhere" behaviour — any existing session using an old
+refresh token will fail the next time it tries to rotate.
+
+The `PasswordResetCode == ""` check at the top catches the "already used"
+case: since the code is cleared after a successful reset, submitting it a
+second time will hit this guard even within the 15-minute window.
+
+<Callout type="warning">
+    bcrypt cost factor 12 is deliberately slow — that's the point. On a modern
+    server it takes roughly 250–400ms per hash, which makes offline dictionary
+    attacks against a leaked database very expensive. Do not lower this below 10
+    in production.
+</Callout>
+
+## API surface
+
+```
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/register` | Public | Create account, send verification email |
+| `POST` | `/auth/verify-email` | Public | Submit OTP to confirm email |
+| `POST` | `/auth/resend-otp` | Public | Issue a fresh verification code |
+| `POST` | `/auth/reset` | Public | Request a password reset code |
+| `POST` | `/auth/reset/new` | Public | Submit code + new password, revoke sessions |
+```
+
+All five endpoints are public — they're reachable before a session exists,
+which is by necessity. The `FindUserByEmail` helper is the shared DB lookup
+used across all of them.

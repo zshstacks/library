@@ -1,6 +1,8 @@
 import React from "react";
 import { Callout } from "./Callout";
 import { CopyButton } from "./CopyButton";
+import { YouTube } from "./Youtube";
+import { Screenshot } from "./Screenshot";
 
 function slugify(text: string): string {
   return text
@@ -19,6 +21,8 @@ const extractText = (node: any): string => {
 
 export const MDX_COMPONENTS = {
   Callout,
+  YouTube,
+  Screenshot,
 
   h2: (props: React.HTMLAttributes<HTMLHeadingElement>) => {
     const text = extractText(props.children);
@@ -62,7 +66,7 @@ export const MDX_COMPONENTS = {
 
   strong: (props: React.HTMLAttributes<HTMLElement>) => (
     <strong
-      className="font-semibold text-zinc-900 dark:text-white/85"
+      className="font-semibold text-zinc-700 dark:text-gray-900"
       {...props}
     />
   ),
@@ -89,14 +93,14 @@ export const MDX_COMPONENTS = {
 
   ul: (props: React.HTMLAttributes<HTMLUListElement>) => (
     <ul
-      className="my-3 pl-5 space-y-1.5 text-[14px] text-zinc-700 dark:text-white/65 list-disc marker:text-zinc-400 dark:marker:text-white/25"
+      className="my-3 pl-5 space-y-1.5 text-[14px] text-zinc-400 dark:text-gray-700/70 list-disc marker:text-zinc-400 dark:marker:text-gray-700/70"
       {...props}
     />
   ),
 
   ol: (props: React.HTMLAttributes<HTMLOListElement>) => (
     <ol
-      className="my-3 pl-5 space-y-1.5 text-[14px] text-zinc-700 dark:text-white/65 list-decimal marker:text-zinc-400 dark:marker:text-white/35"
+      className="my-3 pl-5 space-y-1.5 text-[14px] text-zinc-400 dark:text-gray-700/70 list-decimal marker:text-zinc-400 dark:marker:text-gray-700/70"
       {...props}
     />
   ),

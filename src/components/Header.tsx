@@ -8,6 +8,7 @@ import { MdDarkMode, MdOutlineLightMode } from "react-icons/md";
 import { RxHamburgerMenu } from "react-icons/rx";
 import { IoClose } from "react-icons/io5";
 import { IoLibrary } from "react-icons/io5";
+import "animate.css";
 
 interface HeaderProps {
   theme: "dark" | "light";
@@ -20,7 +21,7 @@ const Header = memo<HeaderProps>(({ theme, setTheme }) => {
   const pathname = usePathname();
 
   const toggleTheme = useCallback(() => {
-    setAnimationClass("animate-bounce");
+    setAnimationClass("animate__animated animate__bounce");
     setTimeout(() => setAnimationClass(""), 800);
     setTheme((prev) => (prev === "light" ? "dark" : "light"));
   }, [setTheme]);

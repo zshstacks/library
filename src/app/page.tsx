@@ -43,10 +43,8 @@ function CategoryCard({
       className={`group block anim-fade-in-up ${DELAY_CLASSES[index] ?? "anim-delay-5"}`}
     >
       <div
-        className="relative h-full rounded-xl border bg-white/[0.04] dark:bg-white/40 p-5 transition-all duration-300 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/20"
-        style={{
-          borderColor: "rgba(255,255,255,0.08)",
-        }}
+        className="relative h-full rounded-xl border bg-white/[0.04] dark:bg-white/40 p-5 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/20"
+        style={{ borderColor: "rgba(255,255,255,0.08)" }}
         onMouseEnter={(e) => {
           (e.currentTarget as HTMLDivElement).style.borderColor =
             `${category.accentColor}55`;
@@ -56,17 +54,18 @@ function CategoryCard({
             "rgba(255,255,255,0.08)";
         }}
       >
+        {/* Soft radial glow that appears on hover */}
         <div
-          className="absolute inset-0 rounded-xl opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none"
+          className="absolute inset-0 rounded-xl opacity-0 group-hover:opacity-100 transition-opacity duration-500 pointer-events-none"
           style={{
-            background: `radial-gradient(ellipse at top left, ${category.accentColor}12 0%, transparent 60%)`,
+            background: `radial-gradient(ellipse at top left, ${category.accentColor}0e 0%, transparent 65%)`,
           }}
         />
 
         <div className="flex items-start justify-between mb-3">
           <div
-            className="p-2 rounded-lg flex items-center justify-center"
-            style={{ background: `${category.accentColor}20` }}
+            className="p-2 rounded-lg flex items-center justify-center transition-colors duration-300"
+            style={{ background: `${category.accentColor}18` }}
           >
             <span style={{ color: category.accentColor }}>
               {ICON_MAP[category.icon]}
@@ -91,11 +90,11 @@ function CategoryCard({
           {category.description}
         </p>
 
-        <div className="flex items-center gap-1 text-[11.5px] text-white/30 dark:text-gray-700/40 group-hover:text-white/65 dark:group-hover:text-gray-700/65 transition-colors">
+        <div className="flex items-center gap-1 text-[11.5px] text-white/30 dark:text-gray-700/40 group-hover:text-white/60 dark:group-hover:text-gray-700/60 transition-colors duration-300">
           <span>Browse notes</span>
           <MdOutlineNavigateNext
             size={13}
-            className="transition-transform duration-200 group-hover:translate-x-0.5"
+            className="transition-transform duration-300 group-hover:translate-x-0.5"
           />
         </div>
       </div>
@@ -115,15 +114,18 @@ export default function HomePage() {
     <main className="min-h-screen text-white/80 dark:text-gray-800">
       <div className="max-w-[900px] mx-auto px-4 sm:px-6 pt-[88px] pb-16">
         <section
-          className="mb-12 transition-all duration-700 ease-out"
+          className="mb-12 transition-all duration-500 ease-out"
           style={{
             opacity: isVisible ? 1 : 0,
-            transform: isVisible ? "translateY(0)" : "translateY(20px)",
+            transform: isVisible ? "translateY(0)" : "translateY(10px)",
           }}
         >
           <div className="mb-5">
             <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-white/5 dark:bg-white/40 border border-white/8 dark:border-gray-800/15 backdrop-blur-sm text-[12px] text-white/55 dark:text-gray-700/60">
-              <IoBookOutline size={13} className="text-[#81e6d9]" />
+              <IoBookOutline
+                size={13}
+                className="text-[#81e6d9] flex-shrink-0"
+              />
               Personal knowledge base
             </span>
           </div>
@@ -144,10 +146,10 @@ export default function HomePage() {
         <section aria-labelledby="categories-heading">
           <h2
             id="categories-heading"
-            className="text-[11px] font-semibold uppercase tracking-widest text-white/28 dark:text-gray-700/38 mb-5 transition-all duration-700 delay-100 ease-out"
+            className="text-[11px] font-semibold uppercase tracking-widest text-white/28 dark:text-gray-700/38 mb-5 "
             style={{
               opacity: isVisible ? 1 : 0,
-              transform: isVisible ? "translateY(0)" : "translateY(10px)",
+              transform: isVisible ? "translateY(0)" : "translateY(8px)",
             }}
           >
             Topics
@@ -165,7 +167,7 @@ export default function HomePage() {
         </section>
 
         <div
-          className="mt-16 text-center transition-opacity duration-700 delay-500"
+          className="mt-16 text-center transition-opacity duration-500 delay-500"
           style={{ opacity: isVisible ? 1 : 0 }}
         >
           <p className="text-[12px] text-white/18 dark:text-gray-700/28">
@@ -174,7 +176,7 @@ export default function HomePage() {
               href="https://zshstacks.vercel.app"
               target="_blank"
               rel="noopener noreferrer"
-              className="text-[#81e6d9]/55 hover:text-[#81e6d9] transition-colors"
+              className="link-underline text-[#81e6d9]/55 hover:text-[#81e6d9] transition-colors"
             >
               zshstacks
             </a>

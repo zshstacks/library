@@ -49,29 +49,25 @@ export default async function ArticlePage({
       <div className="max-w-[900px] mx-auto px-4 sm:px-6 pt-[88px] pb-16">
         {/* Breadcrumb */}
         <nav
-          className="flex items-center gap-2 text-sm mb-8 anim-fade-in-up anim-delay-0"
+          className="flex items-center gap-2 text-sm mb-8 anim-slide-in-left anim-delay-0"
           aria-label="Breadcrumb"
         >
           <Link
             href="/"
-            className="text-[#ff63c3] hover:underline underline-offset-4 hover:opacity-80 transition-opacity"
+            className="link-underline text-[#ff63c3] hover:opacity-80 transition-opacity"
           >
             library
           </Link>
-          <span className="text-white/20 dark:text-gray-800/20 text-xs font-bold">
-            &gt;
-          </span>
+          <span className="text-white/20 dark:text-gray-800/20 text-xs">/</span>
           <Link
             href={`/${category.slug}`}
-            className="hover:underline underline-offset-4 hover:opacity-80 transition-opacity"
+            className="link-underline hover:opacity-80 transition-opacity"
             style={{ color: category.accentColor }}
           >
             {category.label}
           </Link>
-          <span className="text-white/20 dark:text-gray-800/20 text-xs font-bold">
-            &gt;
-          </span>
-          <span className="text-white/55 dark:text-gray-800/55 truncate max-w-[180px]">
+          <span className="text-white/20 dark:text-gray-800/20 text-xs">/</span>
+          <span className="text-white/50 dark:text-gray-800/50 truncate max-w-[180px]">
             {meta.title}
           </span>
         </nav>
@@ -86,18 +82,16 @@ export default async function ArticlePage({
                 {meta.description}
               </p>
 
-              <div className="flex flex-wrap items-center gap-3 text-[12px]">
-                <div className="flex flex-wrap gap-1.5">
-                  {meta.tags.map((tag) => (
-                    <span
-                      key={tag}
-                      className="flex items-center gap-1 px-1.5 py-0.5 rounded text-white/35 dark:text-gray-800/40 bg-white/5 dark:bg-black/5 border border-white/8 dark:border-gray-800/12"
-                    >
-                      <BsTag size={9} />
-                      {tag}
-                    </span>
-                  ))}
-                </div>
+              <div className="flex flex-wrap gap-1.5">
+                {meta.tags.map((tag) => (
+                  <span
+                    key={tag}
+                    className="tag-item items-center gap-1 px-1.5 py-0.5 rounded text-white/35 dark:text-gray-800/40 bg-white/5 dark:bg-black/5 border border-white/8 dark:border-gray-800/12 text-[11px]"
+                  >
+                    <BsTag size={9} />
+                    {tag}
+                  </span>
+                ))}
               </div>
 
               <div className="mt-6 border-t border-white/8 dark:border-gray-800/15" />
@@ -114,7 +108,7 @@ export default async function ArticlePage({
         <div className="mt-16 pt-6 border-t border-white/8 dark:border-gray-800/15 anim-fade-in-up anim-delay-2">
           <Link
             href={`/${category.slug}`}
-            className="inline-flex items-center gap-1.5 text-[13px] text-white/38 dark:text-gray-800/38 hover:text-white/68 dark:hover:text-gray-800/68 transition-colors"
+            className="inline-flex items-center gap-1.5 text-[13px] text-white/38 dark:text-gray-800/38 hover:text-white/65 dark:hover:text-gray-800/65 transition-colors duration-200"
           >
             ← Back to {category.label}
           </Link>

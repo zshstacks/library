@@ -1,0 +1,463 @@
+---
+title: Live Order Book with Binance WebSocket API
+description: Maintaining a real-time order book in Go — fetching the REST snapshot, connecting to the Binance futures depth stream, and applying incremental updates correctly.
+tags: [golang, websocket, binance, trading, realtime]
+readTime: 10
+date: 2025-04-14
+---
+
+## The pattern: snapshot + stream
+
+Binance does not send you a full order book over the WebSocket. It sends
+*incremental diffs* — only the price levels that changed since the last
+message. To reconstruct the full order book you have to:
+
+1. Fetch a full snapshot from the REST endpoint
+2. Open the WebSocket stream
+3. For every incoming message, apply the diff on top of the snapshot
+4. Discard any message whose `lastUpdateId` is older than the snapshot
+
+This is the canonical Binance approach. Skipping step 1 and trying to build
+the book from diffs alone will give you a broken, incomplete picture.
+
+<Callout type="warning">
+    Always fetch the REST snapshot **before** processing any WebSocket messages.
+    If you open the stream first, you risk missing updates that arrived between
+    the two calls and your book will be out of sync.
+</Callout>
+
+## Data structures
+
+Two structs cover everything you need: one for the REST snapshot and one for
+the incremental WebSocket message.
+
+```go
+// snapshot structure for the rest resp
+type OrderBookSnapshot struct {
+	LastUpdateID int64      `json:"lastUpdateId"`
+	Bids         [][]string `json:"bids"`
+	Asks         [][]string `json:"asks"`
+}
+
+// struct from binance for json.unmarshal
+type DepthUpdateMessage struct {
+	Stream string `json:"stream"`
+	Data   struct {
+		FirstUpdateID int64      `json:"U"`
+		LastUpdateID  int64      `json:"u"`
+		Bids          [][]string `json:"b"`
+		Asks          [][]string `json:"a"`
+	} `json:"data"`
+}
+```
+
+Both sides represent price levels as `[][]string` — each inner slice is
+`[price, quantity]`. Binance sends them as strings to preserve decimal
+precision, so you keep them as strings in memory and only parse to `float64`
+when you need to sort or display.
+
+<Callout type="note">
+    `LastUpdateID` on the snapshot and `LastUpdateID` (`u`) on every diff
+    message are your sync anchor. A diff is only valid if its `u` is greater
+    than the snapshot's `lastUpdateId`.
+</Callout>
+
+## Step 1 — fetch the REST snapshot
+
+```go
+snapshotURL := "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=100"
+resp, err := http.Get(snapshotURL)
+if err != nil {
+    log.Fatalf("Failed to fetch snapshot: %v", err)
+}
+defer resp.Body.Close()
+
+body, err := io.ReadAll(resp.Body)
+if err != nil {
+    log.Fatalf("Failed to read snapshot body: %v", err)
+}
+
+var snapshot OrderBookSnapshot
+if err := json.Unmarshal(body, &snapshot); err != nil {
+    log.Fatalf("Failed to unmarshal snapshot: %v", err)
+}
+log.Printf("got snapshot: lastUpdateId=%d bids=%d asks=%d", snapshot.LastUpdateID, len(snapshot.Bids), len(snapshot.Asks))
+
+sortBids(snapshot.Bids)
+sortAsks(snapshot.Asks)
+```
+
+`fapi.binance.com` is the **futures** endpoint. For spot use
+`api.binance.com/api/v3/depth`. After unmarshalling, the bids and asks are
+sorted immediately so index 0 is always the best price.
+
+## Step 2 — connect to the depth stream
+
+```go
+u := url.URL{
+    Scheme:   "wss",
+    Host:     "fstream.binance.com",
+    Path:     "/stream",
+    RawQuery: "streams=btcusdt@depth",
+}
+log.Println("connection to: ", u.String())
+c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+if err != nil {
+    log.Fatalf("dial: %v", err)
+}
+defer c.Close()
+```
+
+`btcusdt@depth` is the combined stream format. Binance wraps the payload in
+a `{"stream":"...","data":{...}}` envelope when you use the `/stream`
+path — that's why `DepthUpdateMessage` has the nested `Data` field.
+
+<Callout type="tip">
+    Use `@depth@100ms` instead of `@depth` to get updates every 100 ms rather
+    than 250 ms. For spot the host is `stream.binance.com:9443` and the futures
+    host is `fstream.binance.com`.
+</Callout>
+
+## Step 3 — apply incremental updates
+
+This is the core of the order book maintenance loop.
+
+```go
+for {
+    _, msg, err := c.ReadMessage()
+    if err != nil {
+        log.Fatalf("read error: %v", err)
+    }
+
+    var depthMsg DepthUpdateMessage
+    if err := json.Unmarshal(msg, &depthMsg); err != nil {
+        log.Printf("failed to parse ws msg: %v", err)
+        continue
+    }
+
+    uLast := depthMsg.Data.LastUpdateID
+    // ignore older updates
+    if uLast <= snapshot.LastUpdateID {
+        continue
+    }
+
+    // apply bid updates
+    for _, upd := range depthMsg.Data.Bids {
+        price := upd[0]
+        qty := upd[1]
+
+        if qty == "0" {
+            // remove price from snapshot.Bids if exists
+            for i, b := range snapshot.Bids {
+                if b[0] == price {
+                    snapshot.Bids = append(snapshot.Bids[:i], snapshot.Bids[i+1:]...)
+                    break
+                }
+            }
+        } else {
+            // update qty if exists, else append
+            found := false
+            for i, b := range snapshot.Bids {
+                if b[0] == price {
+                    snapshot.Bids[i][1] = qty
+                    found = true
+                    break
+                }
+            }
+            if !found {
+                snapshot.Bids = append(snapshot.Bids, []string{price, qty})
+            }
+        }
+    }
+
+    // apply asks updates
+    for _, upd := range depthMsg.Data.Asks {
+        price := upd[0]
+        qty := upd[1]
+
+        if qty == "0" {
+            // remove price from snapshot.Asks if exists
+            for i, a := range snapshot.Asks {
+                if a[0] == price {
+                    snapshot.Asks = append(snapshot.Asks[:i], snapshot.Asks[i+1:]...)
+                    break
+                }
+            }
+        } else {
+            // update qty if exists, else append
+            found := false
+            for i, a := range snapshot.Asks {
+                if a[0] == price {
+                    snapshot.Asks[i][1] = qty
+                    found = true
+                    break
+                }
+            }
+            if !found {
+                snapshot.Asks = append(snapshot.Asks, []string{price, qty})
+            }
+        }
+    }
+
+    // update snapshot id and sort so idx 0 = best
+    snapshot.LastUpdateID = uLast
+
+    sortBids(snapshot.Bids)
+    sortAsks(snapshot.Asks)
+
+    // print top of book
+    if len(snapshot.Bids) > 0 {
+        log.Printf("best bid: %s qty %s", snapshot.Bids[0][0], snapshot.Bids[0][1])
+    } else {
+        log.Printf("best bid: (empty)")
+    }
+    if len(snapshot.Asks) > 0 {
+        log.Printf("best ask: %s qty %s", snapshot.Asks[0][0], snapshot.Asks[0][1])
+    } else {
+        log.Printf("best ask: (empty)")
+    }
+}
+```
+
+The update logic follows a strict three-branch rule for each price level:
+
+- `qty == "0"` → remove the level entirely (it no longer exists in the book)
+- price already in the slice → overwrite the quantity
+- price not found → append as a new level
+
+After every message the snapshot ID is advanced to `uLast` and both sides
+are re-sorted so the best price stays at index 0.
+
+## Sorting helpers
+
+```go
+// helpers: sort bids desc, asks asc
+func sortBids(bids [][]string) {
+	sort.Slice(bids, func(i, j int) bool {
+		pi, _ := strconv.ParseFloat(bids[i][0], 64)
+		pj, _ := strconv.ParseFloat(bids[j][0], 64)
+		return pi > pj
+	})
+}
+
+func sortAsks(asks [][]string) {
+	sort.Slice(asks, func(i, j int) bool {
+		pi, _ := strconv.ParseFloat(asks[i][0], 64)
+		pj, _ := strconv.ParseFloat(asks[j][0], 64)
+		return pi < pj
+	})
+}
+```
+
+Bids sort descending — the highest buyer is the best bid. Asks sort ascending
+— the lowest seller is the best ask. Parsing the price string to `float64`
+only for comparison keeps the stored value as-is.
+
+<Callout type="tip">
+    For a high-throughput production book, replace the `[][]string` slice with
+    a `map[string]string` keyed by price. Lookups and deletions drop from O(n)
+    linear scan to O(1), and you only sort when you need the ordered view.
+</Callout>
+
+## What the output looks like
+
+```
+2025/04/14 12:00:01 got snapshot: lastUpdateId=4521938812 bids=100 asks=100
+2025/04/14 12:00:01 connection to: wss://fstream.binance.com/stream?streams=btcusdt@depth
+2025/04/14 12:00:01 best bid: 83412.10 qty 3.450
+2025/04/14 12:00:01 best ask: 83412.20 qty 1.820
+2025/04/14 12:00:02 best bid: 83412.10 qty 4.120
+2025/04/14 12:00:02 best ask: 83413.00 qty 0.900
+```
+
+The spread between best bid and best ask is the market's current liquidity
+gap. On a liquid pair like BTCUSDT perpetual it will typically be one tick
+wide.
+
+## Full code snippet
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+
+	"github.com/gorilla/websocket"
+)
+
+// snapshot structure for the rest resp
+type OrderBookSnapshot struct {
+	LastUpdateID int64      `json:"lastUpdateId"`
+	Bids         [][]string `json:"bids"`
+	Asks         [][]string `json:"asks"`
+}
+
+// struct from binance for json.unmarshal
+type DepthUpdateMessage struct {
+	Stream string `json:"stream"`
+	Data   struct {
+		FirstUpdateID int64      `json:"U"`
+		LastUpdateID  int64      `json:"u"`
+		Bids          [][]string `json:"b"`
+		Asks          [][]string `json:"a"`
+	} `json:"data"`
+}
+
+func main() {
+	// 1. Fetch initial snapshot from rest
+	snapshotURL := "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=100"
+	resp, err := http.Get(snapshotURL)
+	if err != nil {
+		log.Fatalf("Failed to fetch snapshot: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatalf("Failed to read snapshot body: %v", err)
+	}
+
+	var snapshot OrderBookSnapshot
+	if err := json.Unmarshal(body, &snapshot); err != nil {
+		log.Fatalf("Failed to unmarshal snapshot: %v", err)
+	}
+	log.Printf("got snapshot: lastUpdateId=%d bids=%d asks=%d", snapshot.LastUpdateID, len(snapshot.Bids), len(snapshot.Asks))
+
+	sortBids(snapshot.Bids)
+	sortAsks(snapshot.Asks)
+	// 2. Connect to futures depth ws
+
+	u := url.URL{
+		Scheme:   "wss",
+		Host:     "fstream.binance.com",
+		Path:     "/stream",
+		RawQuery: "streams=btcusdt@depth",
+	}
+	log.Println("connection to: ", u.String())
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		log.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// 3. Read messages and apply updates
+
+	for {
+		_, msg, err := c.ReadMessage()
+		if err != nil {
+			log.Fatalf("read error: %v", err)
+		}
+
+		var depthMsg DepthUpdateMessage
+		if err := json.Unmarshal(msg, &depthMsg); err != nil {
+			log.Printf("failed to parse ws msg: %v", err)
+			continue
+		}
+
+		uLast := depthMsg.Data.LastUpdateID
+		// ignore older updates
+		if uLast <= snapshot.LastUpdateID {
+			continue
+		}
+
+		// apply bid updates
+		for _, upd := range depthMsg.Data.Bids {
+			price := upd[0]
+			qty := upd[1]
+
+			if qty == "0" {
+				// remove price from snapshot.Bids if exists
+				for i, b := range snapshot.Bids {
+					if b[0] == price {
+						snapshot.Bids = append(snapshot.Bids[:i], snapshot.Bids[i+1:]...)
+						break
+					}
+				}
+			} else {
+				// update qty if exists, else append
+				found := false
+				for i, b := range snapshot.Bids {
+					if b[0] == price {
+						snapshot.Bids[i][1] = qty
+						found = true
+						break
+					}
+				}
+				if !found {
+					snapshot.Bids = append(snapshot.Bids, []string{price, qty})
+				}
+			}
+		}
+
+		// apply asks updates
+		for _, upd := range depthMsg.Data.Asks {
+			price := upd[0]
+			qty := upd[1]
+
+			if qty == "0" {
+				// remove price from snapshot.Asks if exists
+				for i, a := range snapshot.Asks {
+					if a[0] == price {
+						snapshot.Asks = append(snapshot.Asks[:i], snapshot.Asks[i+1:]...)
+						break
+					}
+				}
+			} else {
+				// update qty if exists, else append
+				found := false
+				for i, a := range snapshot.Asks {
+					if a[0] == price {
+						snapshot.Asks[i][1] = qty
+						found = true
+						break
+					}
+				}
+				if !found {
+					snapshot.Asks = append(snapshot.Asks, []string{price, qty})
+				}
+			}
+		}
+
+		// update snapshot id and sort so idx 0 = best
+		snapshot.LastUpdateID = uLast
+
+		sortBids(snapshot.Bids)
+		sortAsks(snapshot.Asks)
+
+		// print top of book
+		if len(snapshot.Bids) > 0 {
+			log.Printf("best bid: %s qty %s", snapshot.Bids[0][0], snapshot.Bids[0][1])
+		} else {
+			log.Printf("best bid: (empty)")
+		}
+		if len(snapshot.Asks) > 0 {
+			log.Printf("best ask: %s qty %s", snapshot.Asks[0][0], snapshot.Asks[0][1])
+		} else {
+			log.Printf("best ask: (empty)")
+		}
+	}
+}
+
+// helpers: sort bids desc, asks asc
+func sortBids(bids [][]string) {
+	sort.Slice(bids, func(i, j int) bool {
+		pi, _ := strconv.ParseFloat(bids[i][0], 64)
+		pj, _ := strconv.ParseFloat(bids[j][0], 64)
+		return pi > pj
+	})
+}
+
+func sortAsks(asks [][]string) {
+	sort.Slice(asks, func(i, j int) bool {
+		pi, _ := strconv.ParseFloat(asks[i][0], 64)
+		pj, _ := strconv.ParseFloat(asks[j][0], 64)
+		return pi < pj
+	})
+}
+```

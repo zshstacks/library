@@ -1,7 +1,6 @@
 @import url("https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap");
 @import "tailwindcss";
 
-
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
@@ -12,64 +11,48 @@
     box-sizing: border-box;
 }
 
-.custom-scrollbar::-webkit-scrollbar {
-    width: 2px;
-}
+/* ─── Scrollbars ─────────────────────────────────────────── */
+
+.custom-scrollbar::-webkit-scrollbar { width: 4px; }
+.custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
 .custom-scrollbar::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.05);
-
+    background: rgba(255,255,255,0.06);
+    border-radius: 4px;
 }
-.custom-scrollbar:hover::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.1);
-}
+.custom-scrollbar:hover::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); }
 
-html,
-body {
+html, body {
     margin: 0;
     padding: 0;
     background-color: #202023;
-    transition: background-color 0.3s ease, color 0.3s ease;
+    transition: background-color 0.6s cubic-bezier(0.16, 1, 0.3, 1), color 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
 }
+html.dark body { background-color: #f0e7db; }
 
-html.dark body {
-    background-color: #f0e7db;
-}
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(129,230,217,0.2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(129,230,217,0.5); }
 
-/* Scrollbar */
-::-webkit-scrollbar {
-    width: 6px;
-}
-::-webkit-scrollbar-track {
-    background: transparent;
-}
-::-webkit-scrollbar-thumb {
-    background: rgba(129, 230, 217, 0.3);
-    border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-    background: rgba(129, 230, 217, 0.6);
-}
+::selection { background: rgba(129,230,217,0.15); color: #81e6d9; }
 
-::selection {
-    background: rgba(129, 230, 217, 0.2);
-    color: #81e6d9;
-}
+/* ─── Fonts ───────────────────────────────────────────────── */
+html { font-family: "Geist", sans-serif; }
+code, pre { font-family: "Geist Mono", monospace; }
 
-/* Fonts */
-html {
-    font-family: "Geist", sans-serif;
-}
 
-code,
-pre {
-    font-family: "Geist Mono", monospace;
-}
+/* ════════════════════════════════════════════════════════════
+   KEYFRAMES
+   No blur. No scale. Just a clean vertical drift.
+   5px is the threshold between "felt" and "seen" — intentional.
+   ════════════════════════════════════════════════════════════ */
 
-/* Fade-in keyframes */
-@keyframes fadeInUp {
+@keyframes premiumFadeInUp {
     from {
         opacity: 0;
-        transform: translateY(14px);
+        transform: translateY(6px);
     }
     to {
         opacity: 1;
@@ -77,78 +60,175 @@ pre {
     }
 }
 
+@keyframes premiumSlideInLeft {
+    from {
+        opacity: 0;
+        transform: translateX(-8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+
+
+/* ════════════════════════════════════════════════════════════
+   ENTRANCE UTILITIES
+   cubic-bezier(0.16, 1, 0.3, 1) — hard snap-out.
+   Content lands fast and settles. No floating, no drifting.
+   ════════════════════════════════════════════════════════════ */
 
 .anim-fade-in-up {
-    animation: fadeInUp 0.5s ease-out forwards;
+    will-change: transform, opacity;
+    animation: premiumFadeInUp 0.55s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
-.anim-delay-0   { animation-delay: 0ms; }
-.anim-delay-1   { animation-delay: 80ms; }
-.anim-delay-2   { animation-delay: 160ms; }
-.anim-delay-3   { animation-delay: 240ms; }
-.anim-delay-4   { animation-delay: 320ms; }
-.anim-delay-5   { animation-delay: 400ms; }
 
-/* Prose styles */
+.anim-slide-in-left {
+    will-change: transform, opacity;
+    animation: premiumSlideInLeft 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Delays — logarithmic taper so the cascade finishes before it overstays */
+.anim-delay-0  { animation-delay:   0ms; }
+.anim-delay-1  { animation-delay:  70ms; }
+.anim-delay-2  { animation-delay: 130ms; }
+.anim-delay-3  { animation-delay: 180ms; }
+.anim-delay-4  { animation-delay: 220ms; }
+.anim-delay-5  { animation-delay: 250ms; }
+
+/* Stagger list — intervals compress as the list grows, never feels like a waterfall */
+.stagger-list > * {
+    will-change: transform, opacity;
+    animation: premiumFadeInUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.stagger-list > *:nth-child(1)  { animation-delay:  0ms;  }
+.stagger-list > *:nth-child(2)  { animation-delay:  45ms; }
+.stagger-list > *:nth-child(3)  { animation-delay:  85ms; }
+.stagger-list > *:nth-child(4)  { animation-delay: 118ms; }
+.stagger-list > *:nth-child(5)  { animation-delay: 145ms; }
+.stagger-list > *:nth-child(6)  { animation-delay: 168ms; }
+.stagger-list > *:nth-child(n+7){ animation-delay: 185ms; }
+
+
+/* ════════════════════════════════════════════════════════════
+   HOVER EFFECTS — Calm & Refined
+   ════════════════════════════════════════════════════════════ */
+
+.row-accent {
+    position: relative;
+    transition: background-color 0.4s ease, border-color 0.4s ease;
+}
+
+.row-accent::before {
+    content: '';
+    position: absolute;
+    left: -1px;
+    top: 50%;
+    transform: translateY(-50%) scaleY(0);
+    width: 3px;
+    height: 70%;
+    border-radius: 99px;
+    background: rgba(129,230,217,0.6);
+    transform-origin: center;
+    transition: transform 0.45s cubic-bezier(0.2, 1, 0.3, 1);
+}
+
+.row-accent:hover::before {
+    transform: translateY(-50%) scaleY(1);
+}
+
+.link-underline {
+    position: relative;
+    text-decoration: none;
+}
+.link-underline::after {
+    content: '';
+    position: absolute;
+    bottom: -2px;
+    left: 0;
+    width: 0;
+    height: 1px;
+    background: currentColor;
+    opacity: 0.7;
+    transition: width 0.5s cubic-bezier(0.2, 1, 0.3, 1);
+}
+.link-underline:hover::after { width: 100%; }
+
+.tag-item {
+    display: inline-flex;
+    transition: all 0.3s ease;
+    cursor: default;
+}
+.tag-item:hover {
+    color: rgba(129,230,217,0.9) !important;
+    border-color: rgba(129,230,217,0.3) !important;
+    background: rgba(129,230,217,0.08) !important;
+    transform: translateY(-1px);
+}
+.dark .tag-item:hover {
+    color: rgba(49,151,149,0.9) !important;
+    border-color: rgba(49,151,149,0.3) !important;
+    background: rgba(49,151,149,0.1) !important;
+}
+
+/* ════════════════════════════════════════════════════════════
+   PROSE STYLES
+   ════════════════════════════════════════════════════════════ */
+
 .prose-library h2 {
-    font-size: 1.1rem;
+    font-size: 1.15rem;
     font-weight: 700;
-    color: rgba(255, 255, 255, 0.88);
-    margin: 28px 0 10px;
+    color: rgba(255,255,255,0.92);
+    margin: 36px 0 16px;
+    letter-spacing: -0.015em;
 }
-.dark .prose-library h2 {
-    color: rgba(31, 41, 55, 0.88);
-}
+.dark .prose-library h2 { color: rgba(31,41,55,0.92); }
 
 .prose-library h3 {
-    font-size: 1rem;
+    font-size: 1.05rem;
     font-weight: 600;
-    color: rgba(255, 255, 255, 0.80);
-    margin: 20px 0 8px;
+    color: rgba(255,255,255,0.85);
+    margin: 28px 0 12px;
+    letter-spacing: -0.01em;
 }
-.dark .prose-library h3 {
-    color: rgba(31, 41, 55, 0.80);
-}
+.dark .prose-library h3 { color: rgba(31,41,55,0.85); }
 
 .prose-library p {
-    font-size: 14px;
-    color: rgba(255, 255, 255, 0.65);
-    line-height: 1.78;
-    margin-bottom: 14px;
+    font-size: 15px;
+    color: rgba(255,255,255,0.72);
+    line-height: 1.85;
+    margin-bottom: 24px;
 }
-.dark .prose-library p {
-    color: rgba(31, 41, 55, 0.70);
-}
+.dark .prose-library p { color: rgba(31,41,55,0.75); }
 
 .prose-library pre {
-    background: rgba(0, 0, 0, 0.40);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 8px;
-    padding: 16px;
+    background: rgba(0,0,0,0.35);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 24px;
     overflow-x: auto;
-    margin-bottom: 18px;
+    margin-bottom: 28px;
 }
 .dark .prose-library pre {
-    background: rgba(0, 0, 0, 0.06);
-    border-color: rgba(0, 0, 0, 0.08);
+    background: rgba(0,0,0,0.04);
+    border-color: rgba(0,0,0,0.06);
 }
 
 .prose-library code {
     font-family: "Geist Mono", monospace;
-    font-size: 13px;
+    font-size: 13.5px;
     color: #81e6d9;
 }
-.dark .prose-library code {
-    color: #319795;
-}
+.dark .prose-library code { color: #287a7a; }
 
 .prose-library p code {
-    background: rgba(129, 230, 217, 0.08);
-    border: 1px solid rgba(129, 230, 217, 0.15);
-    padding: 1px 5px;
-    border-radius: 4px;
-    font-size: 12.5px;
+    background: rgba(129,230,217,0.07);
+    border: 1px solid rgba(129,230,217,0.12);
+    padding: 2px 6px;
+    border-radius: 6px;
+    font-size: 13px;
 }
 .dark .prose-library p code {
-    background: rgba(49, 151, 149, 0.10);
-    border-color: rgba(49, 151, 149, 0.20);
+    background: rgba(49,151,149,0.08);
+    border-color: rgba(49,151,149,0.15);
 }

@@ -1,0 +1,594 @@
+---
+title: Uptime Monitor Module in Go
+description: Building an uptime monitor inside a Modular Monolith — GORM models with cascading relations, a concurrent worker pool, raw SQL stats queries, and a clean Echo controller layer.
+tags: [golang, echo, gorm, postgresql, monitoring, backend]
+readTime: 14
+date: 2025-04-22
+---
+
+## Preview
+
+<Screenshot src="/monitor_preview.png"  alt="Monitor uptime preview"
+            caption="Monitor uptime preview"/>
+
+## What the module does
+
+The monitor module lets a user register a URL and have the system ping it on a
+configurable interval. Every ping creates a `Heartbeat` record — status code,
+latency in milliseconds, and any error message. Aggregating those heartbeats
+gives you uptime percentage, average latency, and chart data over time.
+
+The module ships four models, one controller with six endpoints, and a
+background worker that runs independently of the HTTP layer as soon as the
+module is registered.
+
+## Models
+
+### Monitor
+
+The root entity. One monitor belongs to one user and owns many heartbeats.
+
+```go
+package models
+
+import (
+    "time"
+
+    "github.com/zshstacks/markdown-zsh/modules/users/models"
+    "gorm.io/gorm"
+)
+
+type Monitor struct {
+    gorm.Model
+    UserID        uint      `json:"userID"`
+    Name          string    `gorm:"size:30" json:"name"`
+    Type          string    `json:"type"`
+    URL           string    `json:"url"`
+    Timeout       int       `json:"timeout"`
+    Interval      int       `json:"interval"`
+    NotifyEmail   bool      `json:"notify_email"`
+    IsActive      bool      `json:"is_active"`
+    Status        string    `json:"status"`
+    LastCheckedAt time.Time `json:"last_checked_at"`
+
+    User models.User `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE;" json:"user"`
+
+    Heartbeats []Heartbeat `json:"heartbeats" gorm:"foreignKey:MonitorID;constraint:OnDelete:CASCADE;"`
+}
+```
+
+`OnDelete:CASCADE` on both associations means deleting a user cascades to their
+monitors, and deleting a monitor cascades to its heartbeats — no orphaned rows,
+no manual cleanup needed.
+
+`LastCheckedAt` is the worker's scheduling anchor. The worker queries for
+monitors whose `last_checked_at + interval` is in the past, so each monitor
+controls its own check frequency.
+
+### Heartbeat
+
+One record per HTTP check. Latency is stored in milliseconds as `int64`.
+
+```go
+package models
+
+import "gorm.io/gorm"
+
+type Heartbeat struct {
+    gorm.Model
+    MonitorID    uint   `json:"monitor_id"`
+    Latency      int64  `json:"latency"`
+    StatusCode   int    `json:"status_code"`
+    ErrorMessage string `json:"error_message"`
+}
+```
+
+`ErrorMessage` is empty on a successful check and populated when the HTTP
+client returns an error (timeout, DNS failure, connection refused). A non-2xx
+status code with an empty error message means the server responded but with a
+bad status.
+
+### Stats and chart point
+
+Two read-only structs used exclusively as scan targets for raw SQL queries —
+they have no GORM table of their own.
+
+```go
+package models
+
+type MonitorStats struct {
+    UptimePercentage float64 `json:"uptime_percentage"`
+    AverageLatency   float64 `json:"average_latency"`
+    TotalChecks      int64   `json:"total_checks"`
+}
+```
+
+```go
+package models
+
+import "time"
+
+type ChartPoint struct {
+    Timestamp time.Time `json:"timestamp"`
+    Latency   float64   `json:"latency"`
+    Uptime    float64   `json:"uptime"`
+}
+```
+
+## Controller
+
+### Setup and validation
+
+The module wires Echo's validation into a `CustomValidator` that delegates to
+`go-playground/validator`. Once registered on the engine in `main.go`, calling
+`c.Validate(body)` anywhere in the codebase runs the struct tag rules.
+
+```go
+type CustomValidator struct {
+	Validator *validator.Validate
+}
+
+func (cv *CustomValidator) Validate(i interface{}) error {
+	return cv.Validator.Struct(i)
+}
+
+type MonitorController struct {
+	DB  *gorm.DB
+	Cfg infrastructure.AppConfig
+}
+
+func NewMonitorController(db *gorm.DB, cfg infrastructure.AppConfig) *MonitorController {
+	return &MonitorController{DB: db, Cfg: cfg}
+}
+```
+
+### Create
+
+```go
+type CreateMonitorInput struct {
+	Name        string `json:"name" validate:"required,min=3,max=30"`
+	Type        string `json:"type" validate:"required,oneof=http https tcp"`
+	URL         string `json:"url" validate:"required,url"`
+	Timeout     int    `json:"timeout" validate:"required,min=1,max=30"`
+	Interval    int    `json:"interval" validate:"required,min=30,max=3600"`
+	NotifyEmail bool   `json:"notify_email"`
+}
+
+func (mc *MonitorController) Create(c echo.Context) error {
+	var body CreateMonitorInput
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Invalid request body")
+	}
+
+	if err := c.Validate(body); err != nil {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, map[string]string{
+			"message": "Validation failed",
+			"error":   err.Error(),
+		})
+	}
+
+	user, _ := c.Get("user").(userModels.User)
+
+	newMonitor := monitorModels.Monitor{
+		UserID:      user.ID,
+		Name:        body.Name,
+		Type:        body.Type,
+		URL:         body.URL,
+		Timeout:     body.Timeout,
+		Interval:    body.Interval,
+		NotifyEmail: body.NotifyEmail,
+		IsActive:    true,
+		Status:      "pending",
+	}
+
+	if err := mc.DB.Create(&newMonitor).Error; err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to create monitor")
+	}
+
+	return c.JSON(http.StatusCreated, newMonitor)
+}
+```
+
+New monitors start with `Status: "pending"` and `IsActive: true`. The worker
+will pick them up on its next tick because `last_checked_at` is a zero value,
+which satisfies the `IS NULL` branch of the scheduling query.
+
+<Callout type="tip">
+    The `validate:"required,oneof=http https tcp"` tag on `Type` means no extra
+    switch statement or if-chain in the handler — the validator rejects anything
+    outside the allowed set before your code even runs.
+</Callout>
+
+### List with preloaded heartbeats
+
+```go
+func (mc *MonitorController) List(c echo.Context) error {
+	user, _ := c.Get("user").(userModels.User)
+	var monitors []monitorModels.Monitor
+
+	err := mc.DB.Where("user_id = ?", user.ID).
+		Preload("Heartbeats", func(db *gorm.DB) *gorm.DB {
+			return db.Order("created_at DESC").Limit(20)
+		}).
+		Find(&monitors).Error
+
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to fetch monitors")
+	}
+
+	return c.JSON(http.StatusOK, monitors)
+}
+```
+
+The `Preload` callback limits the included heartbeats to the 20 most recent,
+ordered newest-first. Without the limit, a monitor that has been running for
+weeks would include thousands of heartbeat rows in every list response.
+
+### Partial update with pointer fields
+
+```go
+func (mc *MonitorController) Update(c echo.Context) error {
+	id := c.Param("id")
+	user, _ := c.Get("user").(userModels.User)
+
+	var updateBody struct {
+		Name        *string `json:"name" validate:"omitempty,min=3,max=30"`
+		URL         *string `json:"url" validate:"omitempty,url"`
+		Timeout     *int    `json:"timeout" validate:"omitempty,min=1,max=30"`
+		Interval    *int    `json:"interval" validate:"omitempty,min=30,max=3600"`
+		NotifyEmail *bool   `json:"notify_email"`
+		IsActive    *bool   `json:"is_active"`
+	}
+
+	if err := c.Bind(&updateBody); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Invalid request body")
+	}
+
+	var monitor monitorModels.Monitor
+	if err := mc.DB.Where("id = ? AND user_id = ?", id, user.ID).First(&monitor).Error; err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "Monitor not found")
+	}
+
+	updates := make(map[string]interface{})
+	if updateBody.Name != nil {
+		updates["name"] = *updateBody.Name
+	}
+	if updateBody.URL != nil {
+		updates["url"] = *updateBody.URL
+	}
+	if updateBody.Timeout != nil {
+		updates["timeout"] = *updateBody.Timeout
+	}
+	if updateBody.Interval != nil {
+		updates["interval"] = *updateBody.Interval
+	}
+	if updateBody.NotifyEmail != nil {
+		updates["notify_email"] = *updateBody.NotifyEmail
+	}
+	if updateBody.IsActive != nil {
+		updates["is_active"] = *updateBody.IsActive
+	}
+
+	if len(updates) > 0 {
+		if err := mc.DB.Model(&monitor).Updates(updates).Error; err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to update")
+		}
+	}
+
+	return c.JSON(http.StatusOK, monitor)
+}
+```
+
+<Callout type="note">
+    All fields in the update body are pointer types (`*string`, `*bool`). This
+    distinguishes "field was not sent" (`nil`) from "field was explicitly set to
+    its zero value" (`""` or `false`). Without pointers, GORM would silently skip
+    zero-value updates — a classic Go gotcha when doing partial updates.
+</Callout>
+
+### Stats — raw SQL aggregation
+
+```go
+func (mc *MonitorController) GetStats(c echo.Context) error {
+	id := c.Param("id")
+	user, ok := c.Get("user").(userModels.User)
+	if !ok {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Not authenticated")
+	}
+	var monitor monitorModels.Monitor
+	if err := mc.DB.Where("id = ? AND user_id = ?", id, user.ID).First(&monitor).Error; err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "monitor not found")
+	}
+
+	periodParam := c.QueryParam("period")
+	intervals := map[string]string{
+		"24h": "24 hours",
+		"7d":  "7 days",
+		"30d": "30 days",
+	}
+	dbInterval, exists := intervals[periodParam]
+	if !exists {
+		dbInterval = "24 hours"
+	}
+
+	var stats monitorModels.MonitorStats
+	query := fmt.Sprintf(`
+		SELECT
+			COUNT(*) as total_checks,
+			COALESCE(AVG(latency), 0) as average_latency,
+			(COUNT(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0)) as uptime_percentage
+		FROM heartbeats
+		WHERE monitor_id = ? AND created_at > NOW() - INTERVAL '%s'`, dbInterval)
+
+	if err := mc.DB.Raw(query, id).Scan(&stats).Error; err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to calculate stats")
+	}
+
+	return c.JSON(http.StatusOK, stats)
+}
+```
+
+`NULLIF(COUNT(*), 0)` prevents a division-by-zero when there are no heartbeats
+yet — it returns `NULL` instead of panicking, and `COALESCE` upstream can then
+substitute a sensible default. The period is whitelisted through the `intervals`
+map before being interpolated into the query, so there's no SQL injection
+surface even though `fmt.Sprintf` is used.
+
+### Chart data — per-minute bucketing
+
+```go
+func (mc *MonitorController) GetChartData(c echo.Context) error {
+	id := c.Param("id")
+	user, _ := c.Get("user").(userModels.User)
+
+	var monitor monitorModels.Monitor
+	if err := mc.DB.Where("id = ? AND user_id = ?", id, user.ID).First(&monitor).Error; err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "monitor not found")
+	}
+
+	var points []monitorModels.ChartPoint
+	query := `
+   SELECT
+      date_trunc('minute', created_at) as timestamp,
+      AVG(latency) as latency,
+      (COUNT(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 END) * 100.0 / COUNT(*)) as uptime
+   FROM heartbeats
+   WHERE monitor_id = ? AND created_at > NOW() - INTERVAL '24 hours'
+   GROUP BY timestamp
+   ORDER BY timestamp ASC`
+
+	if err := mc.DB.Raw(query, id).Scan(&points).Error; err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to fetch chart data")
+	}
+
+	return c.JSON(http.StatusOK, points)
+}
+```
+
+`date_trunc('minute', created_at)` collapses all heartbeats within the same
+minute into one data point, giving the frontend a fixed-resolution time series
+rather than a raw dump of every individual check.
+
+### Delete
+
+```go
+func (mc *MonitorController) Delete(c echo.Context) error {
+	id := c.Param("id")
+	user, _ := c.Get("user").(userModels.User)
+
+	result := mc.DB.Unscoped().Where("id = ? AND user_id = ?", id, user.ID).Delete(&monitorModels.Monitor{})
+	if result.RowsAffected == 0 {
+		return echo.NewHTTPError(http.StatusNotFound, "Monitor not found")
+	}
+
+	return c.NoContent(http.StatusNoContent)
+}
+```
+
+`Unscoped()` bypasses GORM's soft-delete and removes the row permanently.
+Because the `Heartbeats` association has `OnDelete:CASCADE`, the database
+cleans up all heartbeat rows automatically — no application-level loop needed.
+
+## Background worker
+
+The worker runs independently of the HTTP server. It polls the database every
+10 seconds for monitors that are due a check, then fans them out across a
+bounded goroutine pool.
+
+### Scheduling query
+
+```go
+func (mw *MonitorWorker) processPendingMonitors() {
+    var pendingMonitors []models2.Monitor
+
+    err := mw.DB.Where(
+       "is_active = ? AND (last_checked_at IS NULL OR last_checked_at + (interval * interval '1 second') < NOW())",
+       true,
+    ).Find(&pendingMonitors).Error
+
+    if err != nil {
+       log.Printf("❌ Error fetching pending monitors: %v", err)
+       return
+    }
+
+    if len(pendingMonitors) == 0 {
+       return
+    }
+
+    log.Printf("🔍 Found %d monitors to check", len(pendingMonitors))
+
+    guard := make(chan struct{}, mw.MaxWorkers)
+    var wg sync.WaitGroup
+
+    for _, m := range pendingMonitors {
+       wg.Add(1)
+       guard <- struct{}{} // block if worker limit
+
+       go func(monitor models2.Monitor) {
+          defer wg.Done()
+          mw.checkMonitor(monitor)
+          <-guard // clear space for the next worker
+       }(m)
+    }
+
+    wg.Wait()
+}
+```
+
+The semaphore pattern — a buffered channel of size `MaxWorkers` — caps
+concurrent goroutines at 10. Sending to `guard` blocks when the cap is reached,
+so the loop naturally back-pressures without any external rate limiter. `wg.Wait()`
+ensures all in-flight checks finish before the next ticker fires.
+
+<Callout type="tip">
+    `last_checked_at + (interval * interval '1 second')` is a PostgreSQL
+    interval expression that adds `interval` seconds to the last check timestamp.
+    A monitor with `interval = 60` will only appear in this query once per minute,
+    regardless of how often the worker ticks.
+</Callout>
+
+### HTTP check
+
+```go
+func (mw *MonitorWorker) checkMonitor(monitor models2.Monitor) {
+    start := time.Now()
+
+    client := &http.Client{
+       Timeout: time.Duration(monitor.Timeout) * time.Second,
+    }
+
+    req, err := http.NewRequest("GET", monitor.URL, nil)
+    if err != nil {
+       log.Printf("❌ Failed to create request for %s: %v", monitor.URL, err)
+       return
+    }
+    req.Header.Set("User-Agent", "UptimeMonitor-Worker/1.0 (Golang)")
+
+    resp, err := client.Do(req)
+
+    latency := time.Since(start).Milliseconds()
+    statusCode := 0
+    errMsg := ""
+
+    if err != nil {
+       errMsg = err.Error()
+       log.Printf("⚠️ Monitor %s failed: %v", monitor.Name, err)
+    } else {
+       statusCode = resp.StatusCode
+       resp.Body.Close()
+    }
+
+    heartbeat := models2.Heartbeat{
+       MonitorID:    monitor.ID,
+       Latency:      latency,
+       StatusCode:   statusCode,
+       ErrorMessage: errMsg,
+    }
+    mw.DB.Create(&heartbeat)
+
+    newStatus := "up"
+    if err != nil || statusCode < 200 || statusCode >= 300 {
+       newStatus = "down"
+    }
+
+    mw.DB.Model(&models2.Monitor{}).Where("id = ?", monitor.ID).Updates(map[string]interface{}{
+       "last_checked_at": time.Now(),
+       "status":          newStatus,
+    })
+
+    log.Printf("✅ Checked %s: %s (%dms)", monitor.Name, newStatus, latency)
+}
+```
+
+A per-check `http.Client` is created with the monitor's own `Timeout` value.
+Latency is measured across the full round trip including any redirect hops.
+The heartbeat is written regardless of outcome — both failures and successes
+are recorded so the stats queries have complete data.
+
+<Callout type="warning">
+    `resp.Body.Close()` is called even though the body is never read. If you
+    skip this, the underlying TCP connection won't be returned to the pool,
+    and under sustained load you'll exhaust available file descriptors.
+</Callout>
+
+### Worker start
+
+```go
+func (mw *MonitorWorker) Start(ctx context.Context) {
+    ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
+
+    log.Println("Monitor worker started...")
+
+    for {
+       select {
+       case <-ctx.Done():
+          log.Println("Monitor worker shutting down...")
+          return
+       case <-ticker.C:
+          mw.processPendingMonitors()
+       }
+    }
+}
+```
+
+`ctx.Done()` gives the worker a clean shutdown path. Pass a cancellable context
+from `main` and calling `cancel()` during graceful shutdown will drain the
+current batch and exit the loop cleanly.
+
+## Registering the module
+
+```go
+package monitor
+
+import (
+    "context"
+
+    "github.com/labstack/echo/v4"
+    "github.com/zshstacks/markdown-zsh/internal/infrastructure"
+    "github.com/zshstacks/markdown-zsh/internal/middleware"
+    "github.com/zshstacks/markdown-zsh/modules/monitor/controllers"
+    "github.com/zshstacks/markdown-zsh/modules/monitor/worker"
+    "gorm.io/gorm"
+)
+
+func RegisterRoutes(e *echo.Echo, db *gorm.DB, cfg infrastructure.AppConfig) {
+
+    monitorWorker := worker.NewMonitorWorker(db)
+    go monitorWorker.Start(context.Background())
+
+    mc := controllers.NewMonitorController(db, cfg)
+
+    private := e.Group("/api/monitors")
+    private.Use(middleware.RequireAuth(db, cfg))
+    {
+       private.POST("", mc.Create)
+       private.GET("", mc.List)
+       private.DELETE("/:id", mc.Delete)
+       private.PATCH("/:id", mc.Update)
+       private.GET("/:id/stats", mc.GetStats)
+       private.GET("/:id/chart", mc.GetChartData)
+    }
+}
+```
+
+`RegisterRoutes` starts the worker as a goroutine before mounting any routes.
+This means the worker is live from the first request — a monitor created
+immediately after boot will be checked within 10 seconds. All six endpoints
+sit under `RequireAuth`, so the middleware enforces ownership before any
+handler logic runs.
+
+## API surface
+
+```
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/monitors` | Create a new monitor |
+| `GET` | `/api/monitors` | List all monitors with last 20 heartbeats |
+| `PATCH` | `/api/monitors/:id` | Partial update |
+| `DELETE` | `/api/monitors/:id` | Hard delete with cascade |
+| `GET` | `/api/monitors/:id/stats?period=24h` | Aggregated uptime stats |
+| `GET` | `/api/monitors/:id/chart` | Per-minute time series for the last 24h |
+```
+`period` on the stats endpoint accepts `24h`, `7d`, or `30d`. Anything else
+defaults to `24h`.

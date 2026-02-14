@@ -1,0 +1,733 @@
+---
+title: Actor Model + Binance WebSocket in Go
+description: Streaming live BTC price from Binance using gorilla/websocket and the Hollywood actor library — clean message passing, lifecycle management, and graceful shutdown.
+tags: [golang, websocket, binance, actors, hollywood, realtime]
+readTime: 12
+date: 2025-04-18
+---
+
+## Why actors
+
+A raw goroutine-per-concern approach works, but you quickly end up with
+manually managed channels, scattered `sync.Mutex` guards, and no clear
+ownership of state. The actor model gives you a different contract: each
+piece of state lives in exactly one actor, actors only communicate by sending
+messages, and the engine handles scheduling.
+
+[Hollywood](https://github.com/anthdm/hollywood) is a lightweight Go actor
+library. Actors implement a single `Receive(ctx *actor.Context)` method and
+are spawned, sent messages, and stopped through an `*actor.Engine` — no
+shared memory, no locks needed in the happy path.
+
+## Message types
+
+All communication between actors is typed. Define your messages as plain
+structs up front — they double as a readable contract for what the system can do.
+
+```go
+// Messages
+type (
+	StartWebSocket struct{}
+	StopWebSocket  struct{}
+	PriceUpdate    struct {
+		Symbol    string
+		Price     string
+		Change    string
+		Volume    string
+		Timestamp time.Time
+	}
+)
+```
+
+`StartWebSocket` and `StopWebSocket` are commands — they tell an actor to
+change its behaviour. `PriceUpdate` is an event — it carries data from the
+WebSocket actor to the display actor.
+
+## Binance ticker data structures
+
+```go
+// BinanceTickerData represents the ticker data structure from Binance
+type BinanceTickerData struct {
+	EventType string      `json:"e"`
+	EventTime int64       `json:"E"`
+	Symbol    string      `json:"s"`
+	Price     interface{} `json:"c"`
+	Change    interface{} `json:"P"`
+	Volume    interface{} `json:"v"`
+}
+
+// BinanceMessage represents the WebSocket message structure
+type BinanceMessage struct {
+	Stream string            `json:"stream"`
+	Data   BinanceTickerData `json:"data"`
+}
+```
+
+The `Price`, `Change`, and `Volume` fields are typed as `interface{}` because
+Binance occasionally sends them as a JSON string or a number depending on
+the stream. A small helper normalises them to `string` before the data moves
+anywhere else.
+
+```go
+// Helper function to convert interface{} to string
+func interfaceToString(val interface{}) string {
+	switch v := val.(type) {
+	case string:
+		return v
+	case float64:
+		return fmt.Sprintf("%.8f", v)
+	case int64:
+		return fmt.Sprintf("%d", v)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+```
+
+<Callout type="note">
+    Binance ticker fields like `c` (last price) can arrive as either a JSON
+    string `"83412.10"` or a bare number `83412.10`. Using `interface{}` and
+    normalising early means the rest of the code never has to think about it.
+</Callout>
+
+## Actor hierarchy
+
+The system uses three actors with a clear hierarchy:
+
+```
+SupervisorActor
+└── WebSocketActor
+    └── PriceDisplayActor  (spawned by WebSocketActor on StartWebSocket)
+```
+
+`SupervisorActor` owns the lifecycle — it spawns `WebSocketActor` and is the
+single entry point for shutdown. `WebSocketActor` owns the connection,
+message parsing, and the ping keepalive. `PriceDisplayActor` only knows how
+to format and print a `PriceUpdate`.
+
+## SupervisorActor
+
+```go
+// SupervisorActor manages the lifecycle of other actors
+type SupervisorActor struct {
+	wsActor *actor.PID
+	engine  *actor.Engine
+}
+
+func newSupervisorActor(engine *actor.Engine) actor.Receiver {
+	return &SupervisorActor{
+		engine: engine,
+	}
+}
+
+func (s *SupervisorActor) Receive(ctx *actor.Context) {
+	switch ctx.Message().(type) {
+	case actor.Started:
+		log.Println("SupervisorActor started")
+		// Start WebSocket actor using closure to pass engine
+		s.wsActor = s.engine.Spawn(func() actor.Receiver {
+			return newWebSocketActor(s.engine)
+		}, "websocket")
+		s.engine.Send(s.wsActor, StartWebSocket{})
+
+	case StopWebSocket:
+		if s.wsActor != nil {
+			s.engine.Send(s.wsActor, StopWebSocket{})
+		}
+		s.engine.Poison(ctx.PID())
+
+	case actor.Stopped:
+		log.Println("SupervisorActor stopped")
+	}
+}
+```
+
+`actor.Started` fires as soon as the engine activates the actor — it's the
+right place to spawn children and kick off work. `engine.Poison` schedules a
+graceful stop: the actor finishes its current message then shuts down.
+
+<Callout type="tip">
+    The closure pattern `func() actor.Receiver { return newWebSocketActor(engine) }`
+    is how you pass dependencies into an actor constructor. Hollywood's `Spawn`
+    takes a factory function, so wrapping in a closure is the idiomatic way to
+    inject the engine or any config.
+</Callout>
+
+## WebSocketActor
+
+```go
+// WebSocketActor handles WebSocket connection and message parsing
+type WebSocketActor struct {
+	conn       *websocket.Conn
+	done       chan struct{}
+	priceActor *actor.PID
+	engine     *actor.Engine
+}
+
+func newWebSocketActor(engine *actor.Engine) actor.Receiver {
+	return &WebSocketActor{
+		done:   make(chan struct{}),
+		engine: engine,
+	}
+}
+
+func (w *WebSocketActor) Receive(ctx *actor.Context) {
+	switch ctx.Message().(type) {
+	case actor.Started:
+		log.Println("WebSocketActor started")
+
+	case StartWebSocket:
+		w.startWebSocket()
+
+	case StopWebSocket:
+		w.stopWebSocket()
+
+	case actor.Stopped:
+		log.Println("WebSocketActor stopped")
+		w.stopWebSocket()
+	}
+}
+```
+
+The `done` channel is the shutdown signal shared between the two internal
+goroutines (`readMessages` and `pingTicker`). Both select on it so a single
+`close(w.done)` in `stopWebSocket` shuts them both down cleanly.
+
+### Opening the connection
+
+```go
+func (w *WebSocketActor) startWebSocket() {
+	// Spawn PriceDisplayActor
+	w.priceActor = w.engine.Spawn(newPriceDisplayActor, "price-display")
+
+	// Binance WebSocket URL for BTC/USDT ticker
+	u := url.URL{
+		Scheme:   "wss",
+		Host:     "fstream.binance.com",
+		Path:     "/stream",
+		RawQuery: "streams=btcusdt@ticker",
+	}
+
+	log.Printf("Connecting to: %s", u.String())
+
+	// Dial the WebSocket connection
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		log.Fatal("Connection error:", err)
+	}
+	w.conn = conn
+
+	// Start message reading goroutine
+	go w.readMessages()
+
+	// Start ping ticker
+	go w.pingTicker()
+
+	log.Println("WebSocket connection active. Waiting for BTC price updates...")
+}
+```
+
+### Reading and forwarding messages
+
+```go
+func (w *WebSocketActor) readMessages() {
+	defer close(w.done)
+	for {
+		select {
+		case <-w.done:
+			return
+		default:
+			_, message, err := w.conn.ReadMessage()
+			if err != nil {
+				log.Println("Error reading message:", err)
+				return
+			}
+
+			// Parse the JSON message
+			var binanceMsg BinanceMessage
+			err = json.Unmarshal(message, &binanceMsg)
+			if err != nil {
+				log.Println("Error parsing JSON:", err)
+				continue
+			}
+
+			// Send price update to display actor
+			priceUpdate := PriceUpdate{
+				Symbol:    binanceMsg.Data.Symbol,
+				Price:     interfaceToString(binanceMsg.Data.Price),
+				Change:    interfaceToString(binanceMsg.Data.Change),
+				Volume:    interfaceToString(binanceMsg.Data.Volume),
+				Timestamp: time.Unix(binanceMsg.Data.EventTime/1000, 0),
+			}
+
+			if w.priceActor != nil {
+				w.engine.Send(w.priceActor, priceUpdate)
+			}
+		}
+	}
+}
+```
+
+`binanceMsg.Data.EventTime` is a Unix millisecond timestamp — dividing by
+`1000` converts it to seconds for `time.Unix`. The assembled `PriceUpdate`
+is then sent to `priceActor` via the engine, keeping the display concern
+completely separate.
+
+### Keepalive ping
+
+Binance will close an idle connection after roughly 60 seconds without
+activity. A 30-second ping ticker keeps it alive.
+
+```go
+func (w *WebSocketActor) pingTicker() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.done:
+			return
+		case <-ticker.C:
+			if w.conn != nil {
+				err := w.conn.WriteMessage(websocket.PingMessage, []byte{})
+				if err != nil {
+					log.Println("Error sending ping:", err)
+					return
+				}
+			}
+		}
+	}
+}
+```
+
+### Graceful teardown
+
+```go
+func (w *WebSocketActor) stopWebSocket() {
+	if w.conn != nil {
+		w.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		w.conn.Close()
+	}
+	if w.done != nil {
+		select {
+		case <-w.done:
+		default:
+			close(w.done)
+		}
+	}
+}
+```
+
+The `select` guard around `close(w.done)` prevents a panic if `stopWebSocket`
+is called twice — once from `StopWebSocket` and once from `actor.Stopped`.
+
+<Callout type="warning">
+    Never close a channel twice in Go. The double-select pattern here is the
+    standard way to make a close idempotent when you can't guarantee single
+    ownership at the call site.
+</Callout>
+
+## PriceDisplayActor
+
+```go
+// PriceDisplayActor handles displaying price updates
+type PriceDisplayActor struct{}
+
+func newPriceDisplayActor() actor.Receiver {
+	return &PriceDisplayActor{}
+}
+
+func (p *PriceDisplayActor) Receive(ctx *actor.Context) {
+	switch msg := ctx.Message().(type) {
+	case actor.Started:
+		log.Println("PriceDisplayActor started")
+
+	case PriceUpdate:
+		p.displayPrice(msg)
+
+	case actor.Stopped:
+		log.Println("PriceDisplayActor stopped")
+	}
+}
+
+func (p *PriceDisplayActor) displayPrice(update PriceUpdate) {
+	fmt.Printf("\n=== BTC/USDT Price Update ===\n")
+	fmt.Printf("Time:       %s\n", update.Timestamp.Format("15:04:05"))
+	fmt.Printf("Symbol:     %s\n", update.Symbol)
+	fmt.Printf("Price:      $%s\n", update.Price)
+	fmt.Printf("Change 24h: %s%%\n", update.Change)
+	fmt.Printf("Volume 24h: %s\n", update.Volume)
+	fmt.Printf("=============================\n")
+}
+```
+
+This actor has no state and no goroutines — just a `Receive` switch and a
+display function. Because all `PriceUpdate` messages are delivered
+sequentially by the engine, there's no risk of interleaved output even if
+messages arrive fast.
+
+## Wiring it up in main
+
+```go
+func main() {
+	// Create actor engine
+	engine, err := actor.NewEngine(actor.NewEngineConfig())
+	if err != nil {
+		log.Fatal("Error creating engine:", err)
+	}
+
+	// Spawn supervisor actor using closure to pass engine
+	supervisorPID := engine.Spawn(func() actor.Receiver {
+		return newSupervisorActor(engine)
+	}, "supervisor")
+
+	// Handle graceful shutdown
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+
+	log.Println("Press Ctrl+C to stop")
+
+	// Wait for interrupt signal
+	<-interrupt
+	log.Println("Interrupt signal received")
+
+	// Stop supervisor (which will stop all child actors)
+	engine.Send(supervisorPID, StopWebSocket{})
+
+	// Give actors time to cleanup
+	time.Sleep(2 * time.Second)
+
+	log.Println("Application stopped")
+}
+```
+
+`main` only knows about the supervisor — it sends a single `StopWebSocket`
+message and the cascade propagates down through the hierarchy automatically.
+The 2-second sleep gives actors time to drain their mailboxes and close the
+connection before the process exits.
+
+## What the output looks like
+
+```
+2025/04/18 14:22:01 SupervisorActor started
+2025/04/18 14:22:01 WebSocketActor started
+2025/04/18 14:22:01 PriceDisplayActor started
+2025/04/18 14:22:01 Connecting to: wss://fstream.binance.com/stream?streams=btcusdt@ticker
+2025/04/18 14:22:01 WebSocket connection active. Waiting for BTC price updates...
+
+=== BTC/USDT Price Update ===
+Time:       14:22:02
+Symbol:     BTCUSDT
+Price:      $83412.10
+Change 24h: -1.24%
+Volume 24h: 18423.74000000
+=============================
+
+=== BTC/USDT Price Update ===
+Time:       14:22:03
+Symbol:     BTCUSDT
+Price:      $83389.50
+Change 24h: -1.27%
+Volume 24h: 18424.02000000
+=============================
+```
+
+## Taking it further
+
+This setup is a solid foundation. A few natural next steps would be streaming
+multiple symbols by spawning one `WebSocketActor` per symbol under the same
+supervisor, replacing `PriceDisplayActor` with a `BroadcastActor` that fans
+updates out to connected HTTP clients via the `PriceHub` pattern from the
+order book article, or adding a `ReconnectActor` that watches for read errors
+and respawns `WebSocketActor` automatically after a backoff delay.
+
+## Full code snippet
+
+```go
+
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/url"
+	"os"
+	"os/signal"
+	"time"
+
+	"github.com/anthdm/hollywood/actor"
+	"github.com/gorilla/websocket"
+)
+
+// Messages
+type (
+	StartWebSocket struct{}
+	StopWebSocket  struct{}
+	PriceUpdate    struct {
+		Symbol    string
+		Price     string
+		Change    string
+		Volume    string
+		Timestamp time.Time
+	}
+)
+
+// BinanceTickerData represents the ticker data structure from Binance
+type BinanceTickerData struct {
+	EventType string      `json:"e"`
+	EventTime int64       `json:"E"`
+	Symbol    string      `json:"s"`
+	Price     interface{} `json:"c"`
+	Change    interface{} `json:"P"`
+	Volume    interface{} `json:"v"`
+}
+
+// BinanceMessage represents the WebSocket message structure
+type BinanceMessage struct {
+	Stream string            `json:"stream"`
+	Data   BinanceTickerData `json:"data"`
+}
+
+// Helper function to convert interface{} to string
+func interfaceToString(val interface{}) string {
+	switch v := val.(type) {
+	case string:
+		return v
+	case float64:
+		return fmt.Sprintf("%.8f", v)
+	case int64:
+		return fmt.Sprintf("%d", v)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// WebSocketActor handles WebSocket connection and message parsing
+type WebSocketActor struct {
+	conn       *websocket.Conn
+	done       chan struct{}
+	priceActor *actor.PID
+	engine     *actor.Engine
+}
+
+func newWebSocketActor(engine *actor.Engine) actor.Receiver {
+	return &WebSocketActor{
+		done:   make(chan struct{}),
+		engine: engine,
+	}
+}
+
+func (w *WebSocketActor) Receive(ctx *actor.Context) {
+	switch ctx.Message().(type) {
+	case actor.Started:
+		log.Println("WebSocketActor started")
+
+	case StartWebSocket:
+		w.startWebSocket()
+
+	case StopWebSocket:
+		w.stopWebSocket()
+
+	case actor.Stopped:
+		log.Println("WebSocketActor stopped")
+		w.stopWebSocket()
+	}
+}
+
+func (w *WebSocketActor) startWebSocket() {
+	// Spawn PriceDisplayActor
+	w.priceActor = w.engine.Spawn(newPriceDisplayActor, "price-display")
+
+	// Binance WebSocket URL for BTC/USDT ticker
+	u := url.URL{
+		Scheme:   "wss",
+		Host:     "fstream.binance.com",
+		Path:     "/stream",
+		RawQuery: "streams=btcusdt@ticker",
+	}
+
+	log.Printf("Connecting to: %s", u.String())
+
+	// Dial the WebSocket connection
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		log.Fatal("Connection error:", err)
+	}
+	w.conn = conn
+
+	// Start message reading goroutine
+	go w.readMessages()
+
+	// Start ping ticker
+	go w.pingTicker()
+
+	log.Println("WebSocket connection active. Waiting for BTC price updates...")
+}
+
+func (w *WebSocketActor) readMessages() {
+	defer close(w.done)
+	for {
+		select {
+		case <-w.done:
+			return
+		default:
+			_, message, err := w.conn.ReadMessage()
+			if err != nil {
+				log.Println("Error reading message:", err)
+				return
+			}
+
+			// Parse the JSON message
+			var binanceMsg BinanceMessage
+			err = json.Unmarshal(message, &binanceMsg)
+			if err != nil {
+				log.Println("Error parsing JSON:", err)
+				continue
+			}
+
+			// Send price update to display actor
+			priceUpdate := PriceUpdate{
+				Symbol:    binanceMsg.Data.Symbol,
+				Price:     interfaceToString(binanceMsg.Data.Price),
+				Change:    interfaceToString(binanceMsg.Data.Change),
+				Volume:    interfaceToString(binanceMsg.Data.Volume),
+				Timestamp: time.Unix(binanceMsg.Data.EventTime/1000, 0),
+			}
+
+			if w.priceActor != nil {
+				w.engine.Send(w.priceActor, priceUpdate)
+			}
+		}
+	}
+}
+
+func (w *WebSocketActor) pingTicker() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.done:
+			return
+		case <-ticker.C:
+			if w.conn != nil {
+				err := w.conn.WriteMessage(websocket.PingMessage, []byte{})
+				if err != nil {
+					log.Println("Error sending ping:", err)
+					return
+				}
+			}
+		}
+	}
+}
+
+func (w *WebSocketActor) stopWebSocket() {
+	if w.conn != nil {
+		w.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		w.conn.Close()
+	}
+	if w.done != nil {
+		select {
+		case <-w.done:
+		default:
+			close(w.done)
+		}
+	}
+}
+
+// PriceDisplayActor handles displaying price updates
+type PriceDisplayActor struct{}
+
+func newPriceDisplayActor() actor.Receiver {
+	return &PriceDisplayActor{}
+}
+
+func (p *PriceDisplayActor) Receive(ctx *actor.Context) {
+	switch msg := ctx.Message().(type) {
+	case actor.Started:
+		log.Println("PriceDisplayActor started")
+
+	case PriceUpdate:
+		p.displayPrice(msg)
+
+	case actor.Stopped:
+		log.Println("PriceDisplayActor stopped")
+	}
+}
+
+func (p *PriceDisplayActor) displayPrice(update PriceUpdate) {
+	fmt.Printf("\n=== BTC/USDT Price Update ===\n")
+	fmt.Printf("Time: %s\n", update.Timestamp.Format("15:04:05"))
+	fmt.Printf("Symbol: %s\n", update.Symbol)
+	fmt.Printf("Price: $%s\n", update.Price)
+	fmt.Printf("24h Change: %s%%\n", update.Change)
+	fmt.Printf("24h Volume: %s\n", update.Volume)
+	fmt.Printf("==============================\n")
+}
+
+// SupervisorActor manages the lifecycle of other actors
+type SupervisorActor struct {
+	wsActor *actor.PID
+	engine  *actor.Engine
+}
+
+func newSupervisorActor(engine *actor.Engine) actor.Receiver {
+	return &SupervisorActor{
+		engine: engine,
+	}
+}
+
+func (s *SupervisorActor) Receive(ctx *actor.Context) {
+	switch ctx.Message().(type) {
+	case actor.Started:
+		log.Println("SupervisorActor started")
+		// Start WebSocket actor using closure to pass engine
+		s.wsActor = s.engine.Spawn(func() actor.Receiver {
+			return newWebSocketActor(s.engine)
+		}, "websocket")
+		s.engine.Send(s.wsActor, StartWebSocket{})
+
+	case StopWebSocket:
+		if s.wsActor != nil {
+			s.engine.Send(s.wsActor, StopWebSocket{})
+		}
+		s.engine.Poison(ctx.PID())
+
+	case actor.Stopped:
+		log.Println("SupervisorActor stopped")
+	}
+}
+
+func main() {
+	// Create actor engine
+	engine, err := actor.NewEngine(actor.NewEngineConfig())
+	if err != nil {
+		log.Fatal("Error creating engine:", err)
+	}
+
+	// Spawn supervisor actor using closure to pass engine
+	supervisorPID := engine.Spawn(func() actor.Receiver {
+		return newSupervisorActor(engine)
+	}, "supervisor")
+
+	// Handle graceful shutdown
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+
+	log.Println("Press Ctrl+C to stop")
+
+	// Wait for interrupt signal
+	<-interrupt
+	log.Println("Interrupt signal received")
+
+	// Stop supervisor (which will stop all child actors)
+	engine.Send(supervisorPID, StopWebSocket{})
+
+	// Give actors time to cleanup
+	time.Sleep(2 * time.Second)
+
+	log.Println("Application stopped")
+}
+
+```

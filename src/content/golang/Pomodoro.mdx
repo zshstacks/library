@@ -1,0 +1,687 @@
+---
+title: Server-Side Pomodoro Timer in Go
+description: Building a server-driven Pomodoro timer — GORM model, Redis cache layer, a goroutine ticker that survives browser disconnects, phase auto-transition, and eight clean Gin endpoints.
+tags: [golang, gin, gorm, redis, mysql, timer, backend]
+readTime: 14
+date: 2025-05-02
+---
+
+## Preview
+
+<Screenshot src="/pomodoro_preview.png"  alt="Pomodoro timer preview"
+            caption="Pomodoro timer preview"/>
+
+
+## Why server-side
+
+Most Pomodoro implementations live entirely in the browser. The timer stops
+the moment the tab closes or the user switches devices. A server-side timer
+keeps running regardless — the frontend is just a display that polls or
+reconnects to pick up where the timer left off.
+
+The tradeoff is state management on the backend: the current phase, remaining
+seconds, and completed count all need to survive HTTP requests and be fast to
+read on every tick.
+
+## Project structure
+
+This is from [workspace_go](https://github.com/zshstacks/workspace_go), a
+productivity backend built with Gin, GORM, MySQL, and Redis.
+
+```
+server/
+├── cache/              ← Redis get/set/invalidate helpers
+├── controllers/
+│   └── pomodoroController.go
+├── initializers/       ← DB, Redis, env setup
+├── middleware/         ← RequireAuth
+├── models/
+│   └── pomodoroModel.go
+├── routes/
+│   └── pomodoro_routes.go
+└── utils/
+    └── timer.go        ← goroutine ticker + phase switching
+```
+
+## Model
+
+```go
+package models
+
+import (
+    "gorm.io/gorm"
+)
+
+type PomodoroModel struct {
+    gorm.Model
+    UserID                  uint   `gorm:"unique"`
+    PomodoroDuration        int    `gorm:"default:25"`
+    ShortBreakDuration      int    `gorm:"default:5"`
+    LongBreakDuration       int    `gorm:"default:15"`
+    IsRunning               bool   `gorm:"default:false"`
+    CurrentPhase            string `gorm:"default:'pomodoro'"`
+    RemainingTime           int    `gorm:"default:0"`
+    CompletedPomodoros      int    `gorm:"default:0"`
+    TotalCompletedPomodoros int    `gorm:"default:0"`
+    AutoTransition          bool   `gorm:"default:false"`
+}
+```
+
+One row per user — `UserID` has a `unique` constraint so `GetOrCreate` logic
+in the controller is safe. All durations are stored in minutes; the timer
+converts to seconds (`duration * 60`) when setting `RemainingTime`.
+
+`CompletedPomodoros` tracks the count within the current long-break cycle
+(resets after every 4). `TotalCompletedPomodoros` is a lifetime counter that
+never resets unless the user explicitly calls the reset endpoint.
+
+## Cache layer
+
+Every read in the controller goes through Redis first. The cache key is
+`pomodoro:{userID}` and the value is the serialised `PomodoroModel`. The
+pattern for every write is always the same three steps:
+
+1. `cache.InvalidatePomodoroCache(userID)` — delete the stale entry
+2. `initializers.DB.Save(&settings)` — persist to MySQL
+3. `cache.CachePomodoroSettings(settings)` — write the fresh value back to Redis
+
+This means reads are a Redis hit in the happy path and a MySQL fallback on
+cache miss — the timer goroutine reads state every second, so Redis matters
+here.
+
+<Callout type="note">
+    Invalidate before the DB write, not after. If you write to the DB first
+    and the process crashes before invalidation, Redis serves stale data
+    indefinitely. Invalidating first means a crash at worst causes one extra
+    DB read.
+</Callout>
+
+## Timer goroutine
+
+This is the core of the feature. `StartPomodoroTimer` is called from the
+`StartPomodoro` handler and runs in the background — the HTTP response
+returns immediately while the countdown continues.
+
+```go
+package utils
+
+import (
+    "server/cache"
+    "server/initializers"
+    "sync"
+    "time"
+)
+
+var timerMutex sync.Mutex
+
+func StartPomodoroTimer(userID uint) {
+    timerMutex.Lock()
+    defer timerMutex.Unlock()
+
+    settings, err := cache.GetPomodoroSettingsByUserID(userID)
+    if err != nil {
+       return
+    }
+
+    go func() {
+       timer := time.NewTicker(1 * time.Second)
+       defer timer.Stop()
+
+       for {
+          <-timer.C
+          timerMutex.Lock()
+
+          updatedSettings, err := cache.GetPomodoroSettingsByUserID(userID)
+          if err != nil {
+             timerMutex.Unlock()
+             return
+          }
+          settings = updatedSettings
+
+          if !settings.IsRunning {
+             timerMutex.Unlock()
+             return
+          }
+
+          if settings.RemainingTime <= 0 {
+             // Switch to the next phase
+             switch settings.CurrentPhase {
+             case "pomodoro":
+                settings.TotalCompletedPomodoros++
+                settings.CompletedPomodoros++
+                if settings.CompletedPomodoros%4 == 0 {
+                   settings.CurrentPhase = "longBreak"
+                   settings.RemainingTime = settings.LongBreakDuration * 60
+                } else {
+                   settings.CurrentPhase = "shortBreak"
+                   settings.RemainingTime = settings.ShortBreakDuration * 60
+                }
+             case "shortBreak":
+                settings.CurrentPhase = "pomodoro"
+                settings.RemainingTime = settings.PomodoroDuration * 60
+             case "longBreak":
+                settings.CurrentPhase = "pomodoro"
+                settings.RemainingTime = settings.PomodoroDuration * 60
+             }
+
+             if settings.AutoTransition {
+                settings.IsRunning = true // Continue to next phase
+             } else {
+                settings.IsRunning = false // Stop timer
+             }
+
+             cache.InvalidatePomodoroCache(userID)
+             if err := initializers.DB.Save(&settings).Error; err != nil {
+                timerMutex.Unlock()
+                return
+             }
+
+             cache.CachePomodoroSettings(settings)
+
+             if !settings.AutoTransition {
+                timerMutex.Unlock()
+                return
+             }
+
+             timerMutex.Unlock()
+             continue
+          }
+
+          settings.RemainingTime--
+
+          cache.InvalidatePomodoroCache(userID)
+          initializers.DB.Save(&settings)
+
+          cache.CachePomodoroSettings(settings)
+
+          timerMutex.Unlock()
+       }
+    }()
+}
+```
+
+### How the phase transition logic works
+
+When `RemainingTime` hits zero the phase switch runs:
+
+- `pomodoro` → increments both counters, then checks `CompletedPomodoros % 4`:
+every fourth completed pomodoro triggers a `longBreak`, otherwise `shortBreak`
+- `shortBreak` or `longBreak` → always returns to `pomodoro`
+
+After the switch, `AutoTransition` decides whether `IsRunning` stays `true`
+(the next phase starts immediately) or flips to `false` (the goroutine exits
+and the user has to call `/pomodoro-start` again).
+
+<Callout type="warning">
+    The global `timerMutex` serialises all timer goroutines across all users.
+    This is simple and correct for low concurrency, but it means one user's
+    tick blocks all others while it holds the lock. For a production system
+    with many concurrent users, consider a per-user mutex stored in a `sync.Map`.
+</Callout>
+
+### Reading fresh state on every tick
+
+```go
+updatedSettings, err := cache.GetPomodoroSettingsByUserID(userID)
+settings = updatedSettings
+```
+
+The goroutine re-reads settings from Redis on every tick rather than relying
+on its initial snapshot. This is what allows the `StopPomodoro` handler to
+actually stop the timer — it writes `IsRunning = false` to the cache, and the
+goroutine picks that up on the next second and exits cleanly.
+
+<Callout type="tip">
+    If the goroutine used its initial `settings` snapshot, calling
+    `/pomodoro-stop` would have no effect — the goroutine would never see the
+    `IsRunning = false` update. Reading from the cache on every tick is the
+    pattern that makes external control of the timer possible.
+</Callout>
+
+## Controller
+
+### UpdatePomodoroSettings — create or update
+
+```go
+func UpdatePomodoroSettings(c *gin.Context) {
+	var body struct {
+		Pomodoro       int  `json:"pomodoro"`
+		ShortBreak     int  `json:"shortBreak"`
+		LongBreak      int  `json:"longBreak"`
+		AutoTransition bool `json:"autoTransition"`
+	}
+
+	if c.Bind(&body) != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"errorTimer": "Failed to read body"})
+		return
+	}
+
+	if body.Pomodoro < 1 || body.Pomodoro > 60 {
+		c.JSON(http.StatusBadRequest, gin.H{"errorTimer": "Pomodoro duration must be between 1 and 60 minutes"})
+		return
+	}
+
+	if body.ShortBreak < 1 || body.ShortBreak > 60 {
+		c.JSON(http.StatusBadRequest, gin.H{"errorTimer": "Short break duration must be between 1 and 60 minutes"})
+		return
+	}
+	if body.LongBreak < 1 || body.LongBreak > 60 {
+		c.JSON(http.StatusBadRequest, gin.H{"errorTimer": "Long break duration must be between 1 and 60 minutes"})
+		return
+	}
+
+	user, _ := c.Get("user")
+	currentUser := user.(models.User)
+
+	//get settings using cache
+	settings, err := cache.GetPomodoroSettingsByUserID(currentUser.ID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			settings = models.PomodoroModel{
+				UserID:             currentUser.ID,
+				PomodoroDuration:   body.Pomodoro,
+				ShortBreakDuration: body.ShortBreak,
+				LongBreakDuration:  body.LongBreak,
+				AutoTransition:     body.AutoTransition,
+			}
+			initializers.DB.Create(&settings)
+
+			//add new settings to cache
+			cache.CachePomodoroSettings(settings)
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"errorTimer": "Failed to fetch pomodoro settings"})
+			return
+		}
+	} else {
+		//invalidate cache before update
+		cache.InvalidatePomodoroCache(currentUser.ID)
+
+		settings.PomodoroDuration = body.Pomodoro
+		settings.ShortBreakDuration = body.ShortBreak
+		settings.LongBreakDuration = body.LongBreak
+		settings.AutoTransition = body.AutoTransition
+		initializers.DB.Save(&settings)
+
+		//update cache with new settings
+		cache.CachePomodoroSettings(settings)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": "Settings updated successfully"})
+}
+```
+
+`gorm.ErrRecordNotFound` from the cache layer means the user has never
+configured their timer — a new row is created with their requested values.
+Any other error is a genuine failure and returns 500. This avoids a separate
+"initialize settings" endpoint.
+
+### StartPomodoro — phase check + launch
+
+```go
+func StartPomodoro(c *gin.Context) {
+	user, _ := c.Get("user")
+	currentUser := user.(models.User)
+
+	var body struct {
+		Phase string `json:"phase"`
+	}
+
+	if c.Bind(&body) != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"errorTimer": "Failed to read body"})
+		return
+	}
+
+	//get settings using cache
+	settings, err := cache.GetPomodoroSettingsByUserID(currentUser.ID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errorTimer": "Pomodoro setting not found"})
+		return
+	}
+
+	if settings.IsRunning {
+		c.JSON(http.StatusBadRequest, gin.H{"errorTimer": "Timer already running"})
+		return
+	}
+
+	//invalidate cache before update
+	cache.InvalidatePomodoroCache(currentUser.ID)
+
+	if settings.CurrentPhase != body.Phase {
+		settings.CurrentPhase = body.Phase
+		switch settings.CurrentPhase {
+		case "pomodoro":
+			settings.RemainingTime = settings.PomodoroDuration * 60
+		case "shortBreak":
+			settings.RemainingTime = settings.ShortBreakDuration * 60
+		case "longBreak":
+			settings.RemainingTime = settings.LongBreakDuration * 60
+		}
+	}
+
+	settings.IsRunning = true
+	initializers.DB.Save(&settings)
+
+	//update cache with new settings
+	cache.CachePomodoroSettings(settings)
+
+	utils.StartPomodoroTimer(currentUser.ID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":       "Timer started successfully",
+		"currentPhase":  settings.CurrentPhase,
+		"remainingTime": settings.RemainingTime,
+	})
+}
+```
+
+The phase comparison `settings.CurrentPhase != body.Phase` means if the
+client starts the same phase that's already active, `RemainingTime` is
+preserved — the timer resumes from wherever it left off. Only a phase change
+resets `RemainingTime` to the full duration.
+
+### StopPomodoro
+
+```go
+func StopPomodoro(c *gin.Context) {
+	user, _ := c.Get("user")
+	currentUser := user.(models.User)
+
+	//get settings using cache
+	settings, err := cache.GetPomodoroSettingsByUserID(currentUser.ID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errorTimer": "Pomodoro setting not found"})
+		return
+	}
+
+	if !settings.IsRunning {
+		c.JSON(http.StatusBadRequest, gin.H{"errorTimer": "Timer is not running"})
+		return
+	}
+
+	cache.InvalidatePomodoroCache(currentUser.ID)
+
+	settings.IsRunning = false
+	initializers.DB.Save(&settings)
+
+	cache.CachePomodoroSettings(settings)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":       "Timer stopped successfully",
+		"remainingTime": settings.RemainingTime,
+		"currentPhase":  settings.CurrentPhase,
+	})
+
+}
+```
+
+Writing `IsRunning = false` to both the DB and cache is what signals the
+goroutine to exit on its next tick. The handler returns immediately — it
+doesn't need to wait for the goroutine to acknowledge the stop.
+
+### ChangePhase
+
+```go
+func ChangePhase(c *gin.Context) {
+	user, _ := c.Get("user")
+	currentUser := user.(models.User)
+
+	var body struct {
+		Phase string `json:"phase"`
+	}
+
+	if c.Bind(&body) != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"errorTimer": "Failed to read body"})
+		return
+	}
+
+	//get settings using cache
+	settings, err := cache.GetPomodoroSettingsByUserID(currentUser.ID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errorTimer": "Pomodoro setting not found"})
+		return
+	}
+
+	if settings.CurrentPhase != body.Phase {
+
+		cache.InvalidatePomodoroCache(currentUser.ID)
+
+		settings.CurrentPhase = body.Phase
+		switch settings.CurrentPhase {
+		case "pomodoro":
+			settings.RemainingTime = settings.PomodoroDuration * 60
+		case "shortBreak":
+			settings.RemainingTime = settings.ShortBreakDuration * 60
+		case "longBreak":
+			settings.RemainingTime = settings.LongBreakDuration * 60
+		}
+	}
+
+	initializers.DB.Save(&settings)
+
+	cache.CachePomodoroSettings(settings)
+
+	c.JSON(http.StatusOK, gin.H{"success": "Phase changed", "currentPhase": settings.CurrentPhase})
+}
+```
+
+`ChangePhase` intentionally does not touch `IsRunning`. If the timer is
+currently running and the user switches phase, the goroutine will pick up
+the new `CurrentPhase` and `RemainingTime` on its next read from the cache
+and continue counting down the new phase.
+
+### Remaining handlers
+
+`GetPomodoroSettings` and `FetchPomodoroStatus` are read-only cache hits —
+they return different subsets of the same row:
+
+```go
+func GetPomodoroSettings(c *gin.Context) {
+	user, _ := c.Get("user")
+	currentUser := user.(models.User)
+
+	//get settings using cache
+	settings, err := cache.GetPomodoroSettingsByUserID(currentUser.ID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errorTimer": "Pomodoro setting not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"pomodoro":       settings.PomodoroDuration,
+		"shortBreak":     settings.ShortBreakDuration,
+		"longBreak":      settings.LongBreakDuration,
+		"remainingTime":  settings.RemainingTime,
+		"isRunning":      settings.IsRunning,
+		"currentPhase":   settings.CurrentPhase,
+		"autoTransition": settings.AutoTransition,
+	})
+}
+
+func FetchPomodoroStatus(c *gin.Context) {
+	user, _ := c.Get("user")
+	currentUser := user.(models.User)
+
+	//get settings using cache
+	settings, err := cache.GetPomodoroSettingsByUserID(currentUser.ID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errorTimer": "Pomodoro setting not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+
+		"remainingTime":           settings.RemainingTime,
+		"isRunning":               settings.IsRunning,
+		"currentPhase":            settings.CurrentPhase,
+		"completedPomodoros":      settings.CompletedPomodoros,
+		"totalCompletedPomodoros": settings.TotalCompletedPomodoros,
+		"autoTransition":          settings.AutoTransition,
+	})
+}
+```
+
+`GetPomodoroSettings` is for the settings UI — it returns durations and config.
+`FetchPomodoroStatus` is for the timer UI — it returns the live countdown state.
+The frontend can call `FetchPomodoroStatus` on a short poll interval to sync the
+displayed time with the server without fetching the full settings on every tick.
+
+`UpdateAutoTransition` and `ResetCompletedPomodoros` follow the same
+invalidate → save → re-cache pattern as all other writes:
+
+```go
+func UpdateAutoTransition(c *gin.Context) {
+
+	var body struct {
+		AutoTransition bool `json:"autoTransition"`
+	}
+
+	if err := c.Bind(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"errorTimer": "Failed to read body"})
+		return
+	}
+
+	user, exists := c.Get("user")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"errorTimer": "User is not authenticated"})
+		return
+	}
+	currentUser := user.(models.User)
+
+	//get settings using cache
+	settings, err := cache.GetPomodoroSettingsByUserID(currentUser.ID)
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"errorTimer": "Pomodoro setting not found"})
+
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"errorTimer": "Cant fetch pomodoro settings"})
+		}
+		return
+	}
+
+	cache.InvalidatePomodoroCache(currentUser.ID)
+
+	settings.AutoTransition = body.AutoTransition
+
+	if err := initializers.DB.Save(&settings).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"errorTimer": "Cant update auto transition"})
+		return
+	}
+
+	cache.CachePomodoroSettings(settings)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":        "Auto transition updated successfully",
+		"autoTransition": settings.AutoTransition,
+	})
+}
+
+func ResetCompletedPomodoros(c *gin.Context) {
+	user, _ := c.Get("user")
+	currentUser := user.(models.User)
+
+	settings, err := cache.GetPomodoroSettingsByUserID(currentUser.ID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"errorTimer": "Pomodoro settings not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"errorTimer": "Failed to fetch pomodoro settings"})
+		}
+		return
+	}
+
+	cache.InvalidatePomodoroCache(currentUser.ID)
+
+	settings.CompletedPomodoros = 0
+
+	if err := initializers.DB.Save(&settings).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"errorTimer": "Failed to reset completed pomodoros"})
+		return
+	}
+
+	cache.CachePomodoroSettings(settings)
+
+	c.JSON(http.StatusOK, gin.H{"success": "Completed pomodoros reset to 0"})
+}
+```
+
+`ResetCompletedPomodoros` only zeroes `CompletedPomodoros` — the cycle counter
+for the current long-break cadence. `TotalCompletedPomodoros` is left intact
+as a permanent lifetime record.
+
+## Routes
+
+```go
+package routes
+
+import (
+    "github.com/gin-gonic/gin"
+    "server/controllers"
+    "server/middleware"
+)
+
+func PomodoroRoutes(router *gin.Engine) {
+    router.GET("/pomodoro-settings", middleware.RequireAuth, controllers.GetPomodoroSettings)
+    router.GET("/pomodoro-timer-status", middleware.RequireAuth, controllers.FetchPomodoroStatus)
+    router.POST("/pomodoro-update-settings", middleware.RequireAuth, controllers.UpdatePomodoroSettings)
+    router.POST("/pomodoro-start", middleware.RequireAuth, controllers.StartPomodoro)
+    router.POST("/pomodoro-stop", middleware.RequireAuth, controllers.StopPomodoro)
+    router.POST("/pomodoro-phase", middleware.RequireAuth, controllers.ChangePhase)
+    router.POST("/pomodoro-auto-mode", middleware.RequireAuth, controllers.UpdateAutoTransition)
+    router.POST("/pomodoro-reset", middleware.RequireAuth, controllers.ResetCompletedPomodoros)
+}
+```
+
+All eight endpoints require authentication. `RequireAuth` sets `"user"` in the
+Gin context — every handler reads it with `c.Get("user")` and type-asserts
+to `models.User`.
+
+## Startup
+
+```go
+func init() {
+    initializers.LoadEnvVariables()
+    initializers.ConnectToDb()
+    initializers.SyncDatabase()
+    initializers.ConnectToRedis()
+    initializers.InitOAuthConfigs()
+}
+```
+
+Redis is initialised in `init()` alongside the MySQL connection. The
+`ConnectToRedis` call sets up the client that `cache.*` functions use — if
+Redis is unavailable at startup the app will fail fast rather than silently
+falling back to unresponsive cache reads.
+
+## API surface
+
+```
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/pomodoro-settings` | Config + current state for settings UI |
+| `GET` | `/pomodoro-timer-status` | Live countdown state for timer UI |
+| `POST` | `/pomodoro-update-settings` | Set durations + auto-transition |
+| `POST` | `/pomodoro-start` | Start timer for a given phase |
+| `POST` | `/pomodoro-stop` | Pause timer, preserve remaining time |
+| `POST` | `/pomodoro-phase` | Switch phase without touching IsRunning |
+| `POST` | `/pomodoro-auto-mode` | Toggle auto-transition on/off |
+| `POST` | `/pomodoro-reset` | Zero the completed pomodoros cycle counter |
+```
+## Phase transition diagram
+
+```
+          ┌──────────────────────────────────────────┐
+                         pomodoro (25min)
+           count++ → CompletedPomodoros % 4 == 0?
+          └───────────────┬────────────┬─────────────┘
+                          │ yes        │ no
+                          ▼            ▼
+                    longBreak     shortBreak
+                    (15 min)       (5 min)
+                          │            │
+                          └─────┬──────┘
+                                ▼
+                          pomodoro again
+                     (AutoTransition decides
+                      if timer keeps running)
+```
