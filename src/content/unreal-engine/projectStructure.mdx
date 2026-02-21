@@ -1,0 +1,306 @@
+---
+title: Unreal Engine Project Folder Structure
+description: Organizing an Unreal Engine project from day one — separating game content from third-party assets, C++ source layout with Public/Private mirroring, and a scalable hierarchy that prevents the Content Browser from becoming a junk drawer.
+tags: [unreal-engine, cpp, blueprints, game-dev, project-structure]
+readTime: 9
+date: 2025-05-16
+---
+
+## The problem with flat structure
+
+Unreal's default setup puts everything directly in `Content/`. After a few
+weeks of development, the root folder becomes unusable — blueprints mixed
+with textures, marketplace assets scattered between your own content, no
+clear ownership of anything. Finding a specific asset requires remembering
+its exact name or doing a full-text search.
+
+The solution is **one root folder for your game, one root folder for everything else**.
+
+## Content/ organization
+
+```
+Content/
+├── ProjectAbsolute/              ← YOUR game content ONLY
+│   ├── Blueprints/
+│   │   ├── Characters/
+│   │   │   ├── BP_PlayerCharacter
+│   │   │   └── BP_BaseCharacter
+│   │   ├── Components/
+│   │   ├── GameModes/
+│   │   ├── Weapons/
+│   │   └── Interactables/
+│   ├── Maps/
+│   │   └── TestMaps/
+│   ├── UI/
+│   │   ├── MainMenu/
+│   │   ├── HUD/
+│   │   ├── Voting/
+│   │   └── Widgets/
+│   ├── Materials/
+│   │   ├── Characters/
+│   │   ├── Environment/
+│   │   ├── PostProcess/
+│   │   └── Master/
+│   ├── Meshes/
+│   │   ├── Characters/
+│   │   ├── Weapons/
+│   │   ├── Props/
+│   │   └── Environment/
+│   ├── Textures/
+│   │   ├── Characters/
+│   │   ├── UI/
+│   │   └── Environment/
+│   ├── Animations/
+│   │   ├── Player/
+│   │   └── Weapons/
+│   ├── Audio/
+│   │   ├── SFX/
+│   │   ├── Music/
+│   │   └── Voice/
+│   ├── VFX/
+│   │   └── Particles/
+│   └── Data/
+│       └── DataTables/
+└── ThirdParty/                   ← Purchased/downloaded assets
+    ├── SyntyPack/
+    └── Mixamo/
+```
+
+### ProjectAbsolute/ — your game namespace
+
+Everything you create goes here. Name this folder after your project — using
+the project name as the root folder creates a namespace barrier that prevents
+accidental cross-contamination with plugins or marketplace content.
+
+<Callout type="tip">
+    When importing a marketplace asset, resist the urge to merge it into
+    `ProjectAbsolute/`. Leave it in `ThirdParty/` or the asset's own folder.
+    You want a clear separation: "mine" vs "not mine". This makes it trivial
+    to exclude third-party folders from source control or remove an asset
+    entirely without touching your own work.
+</Callout>
+
+### Blueprints/
+
+All blueprint classes grouped by domain. `Characters/` holds player and AI
+character blueprints. `Components/` is for reusable actor components (health
+bars, inventory, interaction prompts). `GameModes/` contains the game mode,
+game state, and player controller blueprints. `Weapons/` and `Interactables/`
+are feature-specific subfolders.
+
+Each subfolder can have its own `Base` class — `BP_BaseCharacter`,
+`BP_BaseWeapon`, etc. — that defines shared functionality. Concrete
+implementations inherit from these.
+
+### Maps/
+
+Level files. `TestMaps/` is for throw-away test environments — levels you use
+during development to iterate on a feature in isolation. Your main game levels
+(MainMenu, Level01, Lobby, etc.) sit directly in `Maps/`. Keeping test maps
+in a subfolder means they can be excluded from packaging without hunting
+through a flat list.
+
+### UI/
+
+Widget blueprints only. Organize by screen or feature: `MainMenu/` for the
+title screen and settings, `HUD/` for in-game overlays, `Voting/` for a
+multiplayer voting system. `Widgets/` can be a catch-all for reusable UI
+components (buttons, health bars, tooltips) that appear across multiple screens.
+
+### Materials/
+
+Master materials go in `Master/`. These are the parameterized parents that
+define the shading model and core logic. Material instances derived from
+them go into domain-specific subfolders: `Characters/` for skin and clothing
+materials, `Environment/` for terrain and foliage, `PostProcess/` for
+screen-space effects.
+
+<Callout type="note">
+    A material instance is a lightweight reference to a master material with
+    overridden parameters. Creating a new material instance is near-instant
+    and has negligible memory cost — always prefer instances over duplicating
+    a master. Store the master in `Master/` and instances in the relevant
+    subfolder.
+</Callout>
+
+### Meshes/
+
+Static and skeletal meshes grouped by type. `Characters/` holds character
+skeletons and body parts. `Weapons/` is for weapon meshes. `Props/` is for
+interactive objects (doors, crates, pickups). `Environment/` is for walls,
+floors, and set dressing. If a mesh is generic enough to be reused (a wooden
+crate, a standard door), it belongs in `Props/` or `Environment/`, not in a
+level-specific folder.
+
+### Textures/
+
+Base color, normal, roughness, and other texture maps. Mirror the same
+domain split as `Materials/` and `Meshes/`: `Characters/` for character
+textures, `Environment/` for world textures, `UI/` for icons, fonts, and
+HUD graphics. Texture files are often the largest assets in a project by
+disk size — keeping them organized prevents accidentally packaging unused
+high-res textures.
+
+### Animations/
+
+Animation sequences, blend spaces, and montages. `Player/` for first-person
+or third-person player animations. `Weapons/` for weapon-specific animations
+(reload, fire, holster). If you have AI enemies, add an `Enemies/` subfolder.
+The animation blueprint itself usually lives in `Blueprints/Characters/`
+since it's a blueprint class, but the animation assets it references live here.
+
+### Audio/
+
+Sound cues and sound waves. `SFX/` for one-shot effects (gunshots, footsteps,
+impacts). `Music/` for background music tracks. `Voice/` for dialogue and
+voiceovers. Large audio files benefit from streaming — Unreal can stream
+audio directly from disk rather than loading it all into memory, but only if
+you enable the "Streaming" flag on the asset. Keep an eye on `Voice/` and
+`Music/` sizes.
+
+### VFX/
+
+Particle systems, Niagara emitters, and material functions used by effects.
+`Particles/` is the main subfolder. If you're using Niagara (the modern
+particle system), all `.uasset` Niagara emitters go here. Cascade (the legacy
+system) emitters also live here. VFX materials (additive blends, distortion,
+soft particles) can go in `Materials/VFX/` or stay here — pick one and stay
+consistent.
+
+### Data/
+
+Data tables, curves, data assets. `DataTables/` is for CSV-imported tables
+(weapon stats, enemy configurations, loot tables). If you create custom
+`UDataAsset` subclasses in C++, those instances go in a separate `Assets/`
+subfolder. Enums and structs defined in blueprints can also live here if
+they're data-heavy (like a `WeaponType` enum with 50+ entries).
+
+### ThirdParty/
+
+Anything not created by you. Marketplace packs, free assets from Sketchfab,
+Mixamo rigs — it all goes here. Each asset pack gets its own subfolder:
+`SyntyPack/`, `Mixamo/`, `ParagonAssets/`, etc. Do not rename these folders
+or move assets out of them. If the asset pack updates, you want to be able
+to delete the old folder and drop the new one in without conflict.
+
+<Callout type="warning">
+    Some marketplace assets assume they'll be at the root of `Content/` and
+    hardcode absolute paths. If moving them to `ThirdParty/` breaks references,
+    you have two options: (1) leave that specific pack at the root, or (2) use
+    the "Fix Up Redirectors" tool in the Content Browser after moving to repair
+    all broken paths. Choose (2) if the asset is actively used; choose (1) if
+    it's just a reference you rarely touch.
+</Callout>
+
+## Source/ organization
+
+The C++ source code lives outside `Content/` in `Source/ProjectAbsolute/`.
+The standard Unreal layout is:
+
+```
+Source/ProjectAbsolute/
+├── Private/                   ← .cpp implementation files
+│   ├── Characters/
+│   ├── Components/
+│   ├── GameModes/
+│   └── Weapons/
+├── Public/                    ← .h header files
+│   ├── Characters/
+│   ├── Components/
+│   ├── GameModes/
+│   └── Weapons/
+└── ProjectAbsolute.Build.cs   ← Build configuration
+```
+
+### Public/ and Private/ mirroring
+
+Every `.h` file in `Public/` has a corresponding `.cpp` file in `Private/`
+with the same name and the same subfolder path. `Public/Characters/MyCharacter.h`
+pairs with `Private/Characters/MyCharacter.cpp`. This 1:1 mirroring makes it
+trivial to find the implementation of any header.
+
+`Public/` is for declarations — class definitions, function signatures, and
+macros. `Private/` is for the actual logic. The distinction matters because
+Unreal's build system treats `Public/` as the exposed API: other modules can
+include headers from your `Public/` folder but not from `Private/`.
+
+### Why subfolders in C++ match Content/
+
+The subfolder names under `Source/` should mirror the high-level organization
+in `Content/Blueprints/`. If you have `Content/ProjectAbsolute/Blueprints/Weapons/`,
+you should have `Source/ProjectAbsolute/Public/Weapons/` and
+`Source/ProjectAbsolute/Private/Weapons/`. This consistency makes it obvious
+where the C++ base class for a blueprint lives.
+
+For example:
+- `Content/ProjectAbsolute/Blueprints/Characters/BP_PlayerCharacter` (blueprint)
+- inherits from `APlayerCharacter` (C++ class)
+- defined in `Source/ProjectAbsolute/Public/Characters/PlayerCharacter.h`
+- implemented in `Source/ProjectAbsolute/Private/Characters/PlayerCharacter.cpp`
+
+The matching paths reduce cognitive load — you don't have to remember two
+separate mental models for where things are.
+
+## Naming conventions
+
+Unreal has loose official guidelines, but these are the de facto standards:
+
+| Asset Type | Prefix | Example |
+|------------|--------|---------|
+| Blueprint class | `BP_` | `BP_PlayerCharacter` |
+| Widget blueprint | `WBP_` | `WBP_MainMenu` |
+| Material | `M_` | `M_CharacterSkin` |
+| Material instance | `MI_` | `MI_CharacterSkin_Blue` |
+| Texture | `T_` | `T_CharacterDiffuse` |
+| Static mesh | `SM_` | `SM_Crate` |
+| Skeletal mesh | `SK_` | `SK_PlayerBody` |
+| Animation | `A_` or `Anim_` | `A_PlayerIdle` |
+| Particle system | `P_` | `P_Explosion` |
+| Sound cue | `SC_` | `SC_Gunshot` |
+| Data table | `DT_` | `DT_WeaponStats` |
+
+Prefixes prevent name collisions and make the asset type obvious in
+dropdowns. Without prefixes, `PlayerCharacter` could be a blueprint, a
+material, or a sound cue — you won't know until you open it. `BP_PlayerCharacter`
+is unambiguous.
+
+## Why this structure scales
+
+1. **Clear ownership** — everything you make is in `ProjectAbsolute/`, everything
+else is in `ThirdParty/` or a plugin folder. Deleting a marketplace pack is
+one folder delete.
+
+2. **No root clutter** — the `Content/` root has exactly two folders (yours +
+third-party) plus engine content. Opening the Content Browser never shows
+a wall of unrelated assets.
+
+3. **Blueprints stay grouped** — character blueprints are in `Characters/`,
+weapon blueprints are in `Weapons/`. You never have to hunt through a flat
+list of 200+ blueprints.
+
+4. **Materials and textures together** — `Materials/Characters/` and
+`Textures/Characters/` sit next to each other in the tree. You can see
+related assets without expanding distant branches.
+
+5. **C++ mirrors content** — finding the base class for a blueprint is
+deterministic. `BP_PlayerCharacter` inherits from `APlayerCharacter`, which
+is in `Source/.../Characters/`.
+
+6. **Test content isolated** — `Maps/TestMaps/` can be excluded from
+packaging with one filter. Same for `UI/DebugWidgets/` or any other
+throwaway content.
+
+## When to break the rules
+
+If your project is a tiny prototype or a 48-hour game jam, this structure
+is overkill. Use whatever flat layout gets you to a playable build fastest.
+
+If your project has 5+ developers, you'll likely need deeper hierarchies.
+`Characters/` might split into `Characters/Player/` and `Characters/Enemies/`.
+`UI/` might become `UI/Frontend/` and `UI/Gameplay/`. The principles stay
+the same — just add depth where domain boundaries appear.
+
+If you're integrating a middleware plugin (Wwise for audio, Houdini for
+procedural content), that plugin will create its own folder at the root of
+`Content/`. Don't fight it. Treat the plugin folder the same way you treat
+`ThirdParty/` — it's external, leave it alone.
