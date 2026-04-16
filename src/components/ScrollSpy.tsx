@@ -75,7 +75,7 @@ export default function ScrollSpy({
 
   return (
     <nav aria-label="Table of contents" className="sticky top-[100px] w-full">
-      <p className="text-[10.5px] font-semibold uppercase tracking-widest text-white/20 mb-4">
+      <p className="text-[10.5px] font-semibold uppercase tracking-widest text-white/20 dark:text-neutral-500 mb-4">
         On this page
       </p>
       <ul className="space-y-0.5 border-l border-white/5">

@@ -16,7 +16,6 @@ import { Article } from "@/utility/types";
 const ICON_MAP: Record<string, React.ReactNode> = {
   SiUnrealengine: <SiUnrealengine size={18} />,
   SiGo: <SiGo size={18} />,
-  SiDotnet: <SiDotnet size={18} />,
   SiReact: <SiReact size={18} />,
   SiTypescript: <SiTypescript size={18} />,
 };

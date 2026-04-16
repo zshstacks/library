@@ -22,16 +22,6 @@ export const CATEGORIES: CategoryMeta[] = [
     lastUpdated: "2025-01-01",
   },
   {
-    slug: "dotnet",
-    label: ".NET",
-    description:
-      "ASP.NET Core, Entity Framework, CQRS patterns, background services, and the broader .NET ecosystem.",
-    icon: "SiDotnet",
-    accentColor: "#a78bfa",
-    articleCount: 0,
-    lastUpdated: "2025-01-01",
-  },
-  {
     slug: "react",
     label: "React",
     description:

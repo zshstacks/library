@@ -43,7 +43,6 @@ const Header = memo<HeaderProps>(({ theme, setTheme }) => {
   const navLinks = [
     { href: "/unreal-engine", label: "Unreal" },
     { href: "/golang", label: "Golang" },
-    { href: "/dotnet", label: ".NET" },
     { href: "/react", label: "React" },
   ];
 

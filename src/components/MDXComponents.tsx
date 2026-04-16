@@ -66,7 +66,7 @@ export const MDX_COMPONENTS = {
 
   strong: (props: React.HTMLAttributes<HTMLElement>) => (
     <strong
-      className="font-semibold text-zinc-700 dark:text-gray-900"
+      className="font-semibold text-neutral-500 dark:text-gray-900"
       {...props}
     />
   ),

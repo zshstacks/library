@@ -1,0 +1,148 @@
+---
+title: True First-Person Camera in Unreal Engine
+description: Converting the Third Person template into a rock-solid first-person view — Blueprint camera attachment to the head socket, basic wall-clip fixes, and a custom C++ CalcCamera override that eliminates clipping even when landing from a jump.
+tags: [unreal-engine, blueprints, c++, camera, first-person]
+readTime: 12
+date: 2026-04-17
+---
+
+## Preview
+
+<Screenshot src="/unreal-engine/tfpcharacter.png" alt="True first-person camera preview"
+            caption="True first-person camera in Unreal Engine 5 "/>
+
+## Why start from the Third Person template?
+
+Unreal’s built-in First Person template is minimal and doesn’t include the full character mesh, animation blueprint, or movement logic that the Third Person template already has. By converting the Third Person setup you keep all the good stuff (crouch, jump, mantle, etc.) while turning the camera into a true first-person view that lives inside the character’s head.
+
+The only downside is the default camera setup clips through walls and floors in certain situations. We’ll fix that step by step.
+
+## Project setup
+
+1. Create a new **Third Person** project (Blueprint or C++ — doesn’t matter, we’ll add C++ later).
+2. Open **BP_ThirdPersonCharacter** and immediately rename it to **BP_TFPCharacter** (right-click → Rename).
+
+## Blueprint camera conversion
+
+### 1. Remove the default spring arm
+- In the Components panel, delete **CameraBoom**.
+
+### 2. Reparent and configure the camera
+- Rename **FollowCamera** → **FirstPersonCamera**.
+- Drag **FirstPersonCamera** so it becomes a child of **Mesh** (CharacterMesh0).
+- With **FirstPersonCamera** selected, set the following:
+
+**Parent Socket** → `head`
+
+**Transform**
+- Reset transform
+- Location → X: `0`, Y: `7`, Z: `0`
+
+**Rotation**
+- Reset rotation
+- Rotation → X: `-90`, Y: `0`, Z: `80`
+
+**Camera Options**
+- ✅ **Use Pawn Control Rotation**
+
+### 3. Enable controller rotation on the character
+- Select **BP_TFPCharacter** (Self) in the Components panel.
+- In Details → Pawn → ✅ **Use Controller Rotation Yaw**
+
+At this point you already have a working first-person view. Play in editor — the camera is now attached to the head socket and follows mouse look perfectly.
+
+## Fixing basic wall clipping
+
+Two quick tweaks remove most clipping when walking up to walls:
+
+- Select **CapsuleComponent** → Collision → **Capsule Radius** → `34`
+- Go to **Project Settings** → Engine → Rendering → Default Settings → **Near Clip Plane** → `1.0`
+
+These two changes fix 95 % of wall clipping while walking/crouching.
+
+## The jump-landing clipping bug
+
+When you jump and land, the camera still clips through the wall for one or two frames because the capsule drops faster than the camera can react. The Blueprint-only solution isn’t enough here.
+
+## C++ solution: Custom CalcCamera override
+
+We create a small C++ character class that overrides `CalcCamera` and does a quick sphere sweep from the head socket to the final camera location. If anything is hit, we pull the camera back to the impact point.
+
+### 1. Create the C++ class
+
+Right-click in Content Browser → **New C++ Class** → **Character** → Name it `TFPCharacter`.
+
+### TFPCharacter.h
+
+```cpp
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Character.h"
+#include "TFPCharacter.generated.h"
+
+UCLASS()
+class YOURPROJECT_API ATFPCharacter : public ACharacter
+{
+	GENERATED_BODY()
+
+public:
+	ATFPCharacter();
+
+	virtual void CalcCamera(float DeltaTime, FMinimalViewInfo& OutResult) override;
+};
+```
+### TFPCharacter.cpp
+
+```cpp
+#include "TFPCharacter.h"
+#include "Camera/CameraComponent.h"
+
+ATFPCharacter::ATFPCharacter()
+{
+	// We don't need to do anything special in the constructor
+}
+
+void ATFPCharacter::CalcCamera(float DeltaTime, FMinimalViewInfo& OutResult)
+{
+	Super::CalcCamera(DeltaTime, OutResult);
+
+	USkeletalMeshComponent* MeshComp = GetMesh();
+	if (!MeshComp) return;
+
+	// Start trace from the actual head socket, not capsule center
+	FVector Start = MeshComp->GetSocketLocation(FName("head"));
+	FVector End = OutResult.Location;
+
+	// If head socket and camera are basically the same point, skip (no need to sweep)
+	if (FVector::DistSquared(Start, End) < 1.0f) return;
+
+	FHitResult Hit;
+	FCollisionQueryParams Params;
+	Params.AddIgnoredActor(this);
+
+	if (GetWorld()->SweepSingleByChannel(Hit, Start, End, FQuat::Identity,
+		ECC_Camera, FCollisionShape::MakeSphere(6.0f), Params))
+	{
+		OutResult.Location = Hit.Location;
+	}
+}
+```
+<Callout type="note">
+    The sphere radius of `6.0f` gives a nice smooth “camera cushion”. Feel free to tweak it — smaller values are more precise, larger values feel softer.
+</Callout>
+
+###  Re-parent the Blueprint
+
+- Open BP_TFPCharacter.
+- Go to Class Settings (top right).
+- Parent Class → search and select TFPCharacter.
+
+That’s it. The Blueprint now inherits the custom `CalcCamera` logic.
+
+### Final result
+
+- True first-person view attached to the head socket
+- No wall clipping while walking or crouching
+- No floor clipping when landing from a jump
+- Full Third Person template movement, animation, and input still intact
