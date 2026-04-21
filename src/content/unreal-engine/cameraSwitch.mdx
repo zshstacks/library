@@ -1,0 +1,251 @@
+---
+title: Camera Switching in Unreal — First-Person to Third-Person
+description: Toggle between true first-person and third-person cameras in Unreal Engine — Enhanced Input action setup, component hierarchy with mesh-attached FP camera and boom-mounted TP camera, and a simple Flip Flop blueprint that swaps active cameras.
+tags: [unreal-engine, blueprints, camera, enhanced-input, game-dev]
+readTime: 8
+date: 2025-05-18
+---
+
+## Preview
+
+<Screenshot src="/unreal-engine/switchcamera.png"  alt="Switch camera bp preview"
+            caption="Switch camera bp preview"/>
+
+## What "true first-person" means
+
+A true first-person camera is attached directly to the character's mesh —
+usually to a head socket or the root bone. The camera moves exactly as the
+character's head moves, including animation-driven motion (head bob, recoil,
+leaning). This is distinct from a floating first-person camera positioned at
+eye height but not parented to any bone, which is what many tutorials show.
+
+The setup here uses both:
+- **FirstPersonCamera** — child of the character mesh, sees from the character's perspective
+- **ThirdPersonCamera** — child of a spring arm (CameraBoom), sees the character from behind
+
+Only one camera is active at a time. Pressing the input action swaps which
+one is rendering.
+
+## Component hierarchy
+
+```
+BP_TFPCharacter
+├── CapsuleComponent (CollisionCylinder)
+├── ArrowComponent (Arrow)
+├── CameraBoom
+│   └── ThirdPersonCamera
+├── Mesh (CharacterMeshM)
+│   └── FirstPersonCamera
+└── CharacterMovement (CharMoveComp)
+```
+
+### CameraBoom (Spring Arm)
+
+The third-person camera sits on a `USpringArmComponent` called `CameraBoom`.
+The spring arm handles collision — if the camera would clip through a wall,
+the arm compresses and brings the camera closer to the character automatically.
+
+Typical spring arm settings:
+- **Target Arm Length**: `300.0` (distance behind the character)
+- **Use Pawn Control Rotation**: `true` (arm rotates with mouse look)
+- **Enable Camera Lag**: optional (smooths camera movement)
+- **Do Collision Test**: `true` (shrinks the arm on wall collision)
+
+### FirstPersonCamera attached to Mesh
+
+The first-person camera is a direct child of the skeletal mesh component. If
+you have a head bone or a camera socket on your skeleton, attach the camera
+to that socket instead of the mesh root — this makes the camera follow head
+animations.
+
+To attach to a socket:
+1. Select `FirstPersonCamera` in the component tree
+2. In the **Details** panel, find **Socket** under **Sockets**
+3. Set **Parent Socket** to your head socket name (e.g. `head` or `HeadSocket`)
+
+If your mesh doesn't have a head socket, leaving it as a child of the mesh
+component still works — the camera will follow the mesh's root transform.
+
+<Callout type="note">
+    In first-person mode, you'll want to hide the character mesh (or at least
+    the head) to avoid seeing the inside of your own model. This is typically
+    done with a separate first-person arms mesh or by setting the body mesh to
+    "Owner No See" in the render settings.
+</Callout>
+
+## Enhanced Input setup
+
+### Create the Input Action
+
+In the Content Browser, create a new Input Action:
+1. Right-click in `Content/ProjectAbsolute/Input/Actions/`
+2. **Input** → **Input Action**
+3. Name it `IA_CameraSwitch`
+
+Open `IA_CameraSwitch` and set:
+- **Value Type**: `Digital (bool)`
+- **Triggers**: Add a **Pressed** trigger
+
+The Pressed trigger fires once on key press. You don't want a Held trigger
+here — that would spam the camera swap every frame while the key is held.
+
+### Add to Input Mapping Context
+
+Open your Input Mapping Context (e.g. `IMC_Default`) and add a new mapping:
+1. **Mapping Name**: `IA_CameraSwitch`
+2. **Key**: Any key you want (C, V, Tab, Mouse Wheel Click, etc.)
+
+No modifiers needed — just bind the action to a single key.
+
+## Blueprint logic
+
+The camera switch logic lives in the character blueprint's Event Graph. The
+entire system is four nodes:
+
+```
+Enhanced Input Action IA_CameraSwitch (Triggered)
+  → Flip Flop
+      ├─ A → Set Active (FirstPersonCamera, New Active = true)
+      │      Set Active (ThirdPersonCamera, New Active = false)
+      │      Set Use Controller Rotation Yaw (false)
+      │
+      └─ B → Set Active (FirstPersonCamera, New Active = false)
+             Set Active (ThirdPersonCamera, New Active = true)
+             Set Use Controller Rotation Yaw (true)
+```
+
+### Flip Flop node
+
+`Flip Flop` is a built-in blueprint node that alternates between two execution
+pins — **A** and **B** — on each trigger. The first call routes to **A**, the
+second call routes to **B**, the third back to **A**, and so on. It's perfect
+for toggle logic.
+
+Find it by right-clicking the graph and typing "Flip Flop".
+
+### Set Active nodes
+
+`Set Active` is called on a **Scene Component**. Right-click in the graph,
+type "Set Active", then:
+1. Drag your camera component reference from the **Components** panel into
+the graph
+2. Drag a pin from the camera reference to the **Target** pin on `Set Active`
+3. Set the **New Active** checkbox
+
+Each branch of the Flip Flop calls `Set Active` on both cameras with opposite
+boolean values:
+- **A branch** (first-person): `FirstPersonCamera.SetActive(true)`, `ThirdPersonCamera.SetActive(false)`
+- **B branch** (third-person): `FirstPersonCamera.SetActive(false)`, `ThirdPersonCamera.SetActive(true)`
+
+Only the active camera renders. Setting one active implicitly doesn't
+deactivate the other — you need both calls to ensure a clean swap.
+
+### Use Controller Rotation Yaw toggle
+
+The character's **Use Controller Rotation Yaw** setting controls whether the
+character's body rotates to face the camera direction.
+
+- **First-person** (`false`): The character body doesn't rotate with the
+camera. You can look around freely without turning the whole body. The
+character only rotates when you press movement keys.
+
+- **Third-person** (`true`): The character body immediately rotates to face
+where the camera is looking. This is the standard third-person behavior —
+the character always faces forward relative to the camera.
+
+The toggle happens in the same branches as the camera swap:
+- **A branch**: `Set Use Controller Rotation Yaw` = `false`
+- **B branch**: `Set Use Controller Rotation Yaw` = `true`
+
+Without this toggle, first-person would feel wrong — your body would spin
+every time you moved the mouse.
+
+<Callout type="tip">
+    `Use Controller Rotation Yaw` is a property on the **Character Movement**
+    component, not the character actor itself. Drag the `CharacterMovement`
+    component from the **Components** panel to get the reference, then call
+    `Set Use Controller Rotation Yaw` on it.
+</Callout>
+
+## Full blueprint node structure
+
+```
+Event: Enhanced Input Action IA_CameraSwitch (Triggered)
+  |
+  v
+Flip Flop
+  |
+  +---> [A] First-Person Branch
+  |       |
+  |       +---> Set Active
+  |       |       Target: First Person Camera
+  |       |       New Active: ✓ (true)
+  |       |
+  |       +---> Set Active
+  |       |       Target: Third Person Camera
+  |       |       New Active: ☐ (false)
+  |       |
+  |       +---> Set Use Controller Rotation Yaw
+  |               Target: Character Movement
+  |               Use Controller Rotation Yaw: ☐ (false)
+  |
+  +---> [B] Third-Person Branch
+          |
+          +---> Set Active
+          |       Target: First Person Camera
+          |       New Active: ☐ (false)
+          |
+          +---> Set Active
+          |       Target: Third Person Camera
+          |       New Active: ✓ (true)
+          |
+          +---> Set Use Controller Rotation Yaw
+                  Target: Character Movement
+                  Use Controller Rotation Yaw: ✓ (true)
+```
+
+## Why this pattern works
+
+**Single active camera** — Unreal's player controller automatically uses
+whichever camera component is marked active and has the highest priority. By
+ensuring only one camera is active at a time, there's no priority conflict or
+blend between cameras. The swap is instant.
+
+**No camera manager needed** — Some tutorials add a custom Player Camera
+Manager or use `Set View Target with Blend`. Those are useful for smooth
+transitions or cinematic cameras, but for an instant toggle, `Set Active` is
+simpler and has zero overhead.
+
+**State preserved in Flip Flop** — The Flip Flop node remembers which branch
+it routed to last. The character blueprint doesn't need a `bIsFirstPerson`
+boolean variable — the Flip Flop itself is the state.
+
+## Common issues
+
+### Camera jitter in first-person
+
+If the first-person camera shakes or jitters, it's usually because **Use Pawn
+Control Rotation** is enabled on both the camera and the spring arm. First-person
+cameras should have:
+- **Use Pawn Control Rotation**: `false` (camera inherits rotation from mesh/socket)
+
+The character movement component handles rotation via **Use Controller Rotation Yaw**.
+
+### Character mesh visible in first-person
+
+The character's head or body might be visible when in first-person mode. Fix
+this by either:
+1. Using a separate first-person arms mesh with no body
+2. Setting the body mesh to **Owner No See** in the **Rendering** section of
+the mesh component's details
+3. Hiding the head bone via a skeletal mesh socket or animation blueprint
+
+### Spring arm clipping through walls
+
+If the third-person camera clips through geometry, check:
+- **Do Collision Test** on the spring arm is `true`
+- **Probe Size** is greater than `0.0` (default `12.0` works for most cases)
+- **Probe Channel** is set to `Camera` or `Visibility`
+
+The spring arm traces along its length every frame — if the trace hits
+something, the arm shrinks to keep the camera outside the collision.
