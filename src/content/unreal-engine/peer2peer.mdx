@@ -1,0 +1,381 @@
+---
+title: Peer-to-Peer Multiplayer Setup in Unreal Engine
+description: Setting up local P2P multiplayer with Advanced Sessions Plugin — GameInstance session management, host and join workflows with Enhanced Input, NULL subsystem for development testing, and EOS configuration for Steam deployment.
+tags: [unreal-engine, blueprints, multiplayer, networking, advanced-sessions, p2p]
+readTime: 12
+date: 2025-05-20
+---
+
+## Preview
+
+<Screenshot src="/unreal-engine/preview.png"  alt="Peer2Peer preview"
+            caption="Peer2Peer preview"/>
+
+## Overview
+
+This setup uses the **Advanced Sessions Plugin** for peer-to-peer multiplayer
+with LAN or internet connectivity. During development, the `NULL` online
+subsystem allows local testing without Steam or Epic accounts. For release,
+the configuration switches to Epic Online Services (EOS) for Steam integration.
+
+The architecture is simple:
+- **BP_GameInstance** — session lifecycle (create, find, join)
+- **BP_TFPCharacter** — input bindings (H to host, J to join)
+- **DefaultEngine.ini** — subsystem configuration
+
+## Installing Advanced Sessions Plugin
+
+The Advanced Sessions Plugin extends Unreal's base session API with quality-of-life
+features: better server browser filters, Steam lobby integration, and simplified
+session settings.
+
+Install from the official website:
+```
+https://vreue4.com/advanced-sessions-binaries
+```
+
+After installation, enable the plugin in **Edit → Plugins** and restart the editor.
+
+## DefaultEngine.ini configuration
+
+### Development — NULL subsystem
+
+```ini
+[OnlineSubsystem]
+DefaultPlatformService=NULL
+```
+
+The `NULL` subsystem is Unreal's built-in LAN networking backend. It requires
+no external services — sessions are advertised and discovered via UDP broadcast
+on the local network. Perfect for early development and split-screen testing
+on a single machine.
+
+To test multiplayer with `NULL`:
+1. Package the project or use PIE (Play In Editor) with "Run Dedicated Server"
+2. Launch multiple instances (Editor + standalone, or two standalone builds)
+3. Host on one instance, join from the other
+
+### Production — EOS for Steam
+
+```ini
+[OnlineSubsystem]
+DefaultPlatformService=EOS
+
+[OnlineSubsystemEOS]
+bEnabled=true
+
+[/Script/OnlineSubsystemEOS.NetDriverEOS]
+bIsUsingP2PSockets=true
+
+[/Script/Engine.GameEngine]
++NetDriverDefinitions=(DefName="GameNetDriver",DriverClassName="/Script/OnlineSubsystemEOS.NetDriverEOS",DriverClassNameFallback="/Script/OnlineSubsystemUtils.IpNetDriver")
+
+[EOSSettings]
+CacheDir=CacheDir
+DefaultArtifactName=ProjectRebornClient
+TickBudgetInMilliseconds=0
+bEnableOverlay=true
+bEnableSocialOverlay=true
+bEnableEditorOverlay=true
+bShouldEnforceBeingLaunchedByEGS=false
++Artifacts=(ArtifactName="ProjectRebornClient",ClientId="xyza7891...",ClientSecret="plwohmqjo...",ProductId="8990f267...",SandboxId="0e666da2...",DeploymentId="bf397f3b...",EncryptionKey="0000000...")
+
+[/Script/OnlineSubsystemEOS.EOSSettings]
+CacheDir=CacheDir
+DefaultArtifactName=ProjectRebornClient
+TickBudgetInMilliseconds=0
+bEnableOverlay=True
+bEnableSocialOverlay=True
+bEnableEditorOverlay=True
+bUseEAS=True
+bUseEOSConnect=True
+bUseEOSRTC=True
++AuthScopeFlags=BasicProfile
++AuthScopeFlags=FriendsList
++AuthScopeFlags=Presence
+```
+
+**Epic Online Services (EOS)** acts as a cross-platform backend — it works with
+Steam, Epic Games Store, and standalone builds. The `bIsUsingP2PSockets=true`
+setting enables peer-to-peer connections instead of dedicated servers.
+
+The `ClientId`, `ClientSecret`, and other artifact fields come from your Epic
+Developer Portal project. These credentials link your game to EOS matchmaking
+and presence services.
+
+<Callout type="warning">
+    Never commit real `ClientId` and `ClientSecret` values to public repositories.
+    Use environment variables or a config file excluded from source control.
+    The example values here are placeholders.
+</Callout>
+
+## BP_GameInstance — session management
+
+The GameInstance persists across level transitions, making it the correct place
+to store session state. Both host and join logic live here.
+
+### HostSession — create and open level
+
+<Screenshot src="/unreal-engine/createses.png"  alt="HostSession preview"
+            caption="HostSession preview"/>
+
+```
+Event: Custom Event "HostSession"
+  ├─ Input: Player Controller (PlayerController reference)
+  │
+  ├─ Create Advanced Session
+  │   ├─ Public Connections: 10
+  │   ├─ Use LAN: true (for NULL subsystem) / false (for EOS)
+  │   ├─ Should Advertise: true
+  │   ├─ Use Lobbies If Available: false
+  │   ├─ Allow Join Via Presence: true
+  │   ├─ Allow Join Via Presence Friends Only: false
+  │   ├─ Anti Cheat Protected: false
+  │   ├─ Uses Stats: false
+  │   └─ Allow Invites: true
+  │
+  ├─ On Success → Open Level (by Name)
+  │   └─ Level Name: "Lvl_ThirdPerson/ThirdPerson"
+  │       Options: "?listen"
+  │
+  └─ On Failure → Print String
+      └─ "Failed to create session"
+```
+
+#### Create Advanced Session settings
+
+- **Public Connections**: Max players (10 in this case — 1 host + 9 clients)
+- **Use LAN**: `true` for `NULL` subsystem (local network broadcast), `false`
+for internet-based EOS sessions
+- **Should Advertise**: Makes the session discoverable in server browsers
+- **Allow Join Via Presence**: Allows Steam friends to join directly from
+the friends list without searching
+- **Allow Invites**: Enables sending invite notifications to other players
+
+#### Open Level with "?listen"
+
+```
+Open Level (by Name): "Lvl_ThirdPerson/ThirdPerson?listen"
+```
+
+The `?listen` option tells the engine to open the level as a **listen server** —
+the host is both a server and a client. Dedicated servers use `?dedicated`
+instead and render no viewport.
+
+<Callout type="note">
+    The level name must be the full path from the `Content/` root:
+    `"Lvl_ThirdPerson/ThirdPerson"` opens `Content/Lvl_ThirdPerson/ThirdPerson.umap`.
+    Relative paths like `"ThirdPerson"` will fail if the level isn't in the root.
+</Callout>
+
+### FindSession — search and join
+
+<Screenshot src="/unreal-engine/findjoin.png"  alt="FindSession preview"
+            caption="FindSession preview"/>
+
+```
+Event: Custom Event "FindSession"
+  ├─ Input: Player Controller (PlayerController reference)
+  │
+  ├─ Find Sessions (Advanced)
+  │   ├─ Max Results: 10
+  │   ├─ Use LAN: true (must match host setting)
+  │   └─ Filters:
+  │       ├─ Empty Servers Only: false
+  │       ├─ Non Empty Servers Only: false
+  │       ├─ Secure Servers Only: false
+  │       └─ Min Slots Available: 1
+  │
+  ├─ On Success → Get Session (index 0)
+  │   └─ Session Results array → GET (index 0) → Session Result
+  │
+  ├─ Print String (for debugging)
+  │   └─ "Failed to join session" (red)
+  │
+  └─ Join Session
+      ├─ Session Result: (from GET node)
+      └─ Player Controller: (from input)
+```
+
+#### Find Sessions Advanced
+
+Searches for available sessions matching the filter criteria. Returns an array
+of `SessionResults` — each entry is a discoverable session.
+
+- **Max Results**: Number of sessions to return (10 is a reasonable default)
+- **Use LAN**: Must match the host's `Use LAN` setting. If the host used
+`LAN=true`, the client must search with `LAN=true`.
+- **Min Slots Available**: Only return sessions with at least N open slots
+
+#### Get Session (index 0)
+
+The `Find Sessions` node outputs a `Session Results` array. `GET` with index `0`
+retrieves the first found session. In a real implementation, you'd loop through
+the array and present a server browser UI for the player to choose.
+
+For quick testing, auto-joining the first result is fine.
+
+#### Join Session
+
+Takes the `Session Result` struct and the player controller. On success, the
+engine automatically travels to the host's level — no `Open Level` call needed
+on the client side.
+
+<Callout type="tip">
+    If `Join Session` succeeds but the level never loads, check the Output Log
+    for "Travel failure" errors. Common causes: level name mismatch between
+    host and client, or missing level in the packaged build.
+</Callout>
+
+## BP_TFPCharacter — input bindings
+
+The character blueprint triggers the GameInstance functions via Enhanced Input
+actions.
+
+<Screenshot src="/unreal-engine/pressed.png"  alt="Input bindings preview"
+            caption="Input bindings preview"/>
+
+### Create session — H key
+
+```
+Event: Enhanced Input Action (H)
+  ├─ Triggered
+  │
+  ├─ Get Game Instance
+  │   └─ Cast to BP_GameInstance
+  │
+  ├─ Get Player Controller (Player Index: 0)
+  │
+  └─ Host Session (custom event on BP_GameInstance)
+      └─ Player Controller: (from Get Player Controller)
+```
+
+1. `Get Game Instance` retrieves the global GameInstance
+2. Cast to `BP_GameInstance` to access custom events
+3. `Get Player Controller` gets the local player's controller (index 0 for single-player input)
+4. Call `Host Session` with the player controller reference
+
+### Join session — J key
+
+```
+Event: Enhanced Input Action (J)
+  ├─ Triggered
+  │
+  ├─ Get Game Instance
+  │   └─ Cast to BP_GameInstance
+  │
+  ├─ Get Player Controller (Player Index: 0)
+  │
+  └─ Find Session (custom event on BP_GameInstance)
+      └─ Player Controller: (from Get Player Controller)
+```
+
+Identical structure to the host logic, but calls `Find Session` instead of
+`Host Session`.
+
+### Why GameInstance and not Character?
+
+Session logic belongs in the **GameInstance** because:
+1. **Persists across levels** — when the host opens the multiplayer level via
+`Open Level`, the character blueprint is destroyed and recreated. The
+GameInstance survives the transition.
+2. **Single source of truth** — only one GameInstance exists per game, but
+characters respawn and duplicate in multiplayer. Session state must not
+live in a per-player object.
+
+The character's job is just input routing — press H, call GameInstance.HostSession().
+
+## Testing locally with NULL subsystem
+
+1. **Set subsystem to NULL** in `DefaultEngine.ini`:
+```ini
+[OnlineSubsystem]
+DefaultPlatformService=NULL
+   ```
+
+2. **PIE settings** — open **Editor Preferences → Level Editor → Play**:
+- **Number of Players**: 2
+- **Net Mode**: Play As Listen Server
+- **Run Dedicated Server**: unchecked (unless testing dedicated server)
+
+3. **Launch and test**:
+- PIE spawns two windows (host + client)
+- In the **Server window** (window 1), press **H** to create the session
+- The server loads `Lvl_ThirdPerson` with `?listen` and becomes joinable
+- In the **Client window** (window 2), press **J** to find and join
+- The client should travel to the host's level automatically
+
+4. **Debugging**:
+- Add `Print String` nodes after each session node with `Duration: 5.0` and
+different colors to see which branch fires
+- Check the **Output Log** for "LogOnline" and "LogNet" messages
+- Common failure: `Use LAN` mismatch between host and client
+
+## Moving to Steam with EOS
+
+When ready to deploy on Steam:
+
+1. **Register your game** on the Epic Developer Portal and Steam Partner portal
+2. **Copy credentials** from Epic's portal into `DefaultEngine.ini` (ClientId,
+ClientSecret, ProductId, etc.)
+3. **Enable Steam App ID** in your Steam app settings
+4. **Switch subsystem** in `DefaultEngine.ini`:
+```ini
+[OnlineSubsystem]
+DefaultPlatformService=EOS
+   ```
+5. **Set Use LAN to false** in the `Create Advanced Session` node
+
+EOS handles the Steam authentication and matchmaking automatically. Players
+join via Steam presence (right-click friend → "Join Game") or through your
+in-game server browser.
+
+<Callout type="note">
+    Steam requires `steam_appid.txt` in the game's root directory during
+    development. This file contains a single line with your Steam App ID.
+    Without it, Steam API initialization fails.
+</Callout>
+
+## Common issues
+
+### "Failed to create session" immediately
+
+**Cause**: Online subsystem not initialized or `Use LAN` setting wrong.
+
+**Fix**: Check the Output Log for `LogOnlineSession` warnings. Verify
+`DefaultPlatformService=NULL` is set correctly. Restart the editor after
+changing ini files.
+
+### Client joins but spawns in the wrong level
+
+**Cause**: The client is loading a local copy of the level instead of traveling
+to the server's level.
+
+**Fix**: Ensure `Open Level` on the host includes the full level path
+(`Lvl_ThirdPerson/ThirdPerson`) and the `?listen` option. The client should
+**not** call `Open Level` at all — `Join Session` handles travel automatically.
+
+### "Session not found" when searching
+
+**Cause**: Host and client `Use LAN` mismatch, or sessions not advertising.
+
+**Fix**: Both host and client must use the same `Use LAN` value (`true` for
+NULL, `false` for EOS). Verify `Should Advertise` is `true` on the host.
+
+### Multiple clients can't connect
+
+**Cause**: `Public Connections` set too low, or firewall blocking ports.
+
+**Fix**: Increase `Public Connections` to the max player count + 1 (for the
+host). For LAN, ensure UDP ports 7777 (game) and 15000 (beacon) are open.
+
+## Blueprint debugging tips
+
+- **Print Session Count**: After `Find Sessions`, print the length of the
+`Session Results` array. If it's `0`, no sessions were found.
+- **Print Join Success**: Add a `Print String` on the `On Success` pin of
+`Join Session` with the text "Joined successfully!" in green.
+- **Log Level Name**: Before `Open Level`, print the level name string to
+verify it's correct. Typos here fail silently.
+- **Use Duration**: Set `Print String` duration to `5.0` or higher. Messages
+disappear too fast at the default `2.0` during level transitions.
