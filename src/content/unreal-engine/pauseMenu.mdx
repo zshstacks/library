@@ -1,0 +1,88 @@
+---
+title: Modular Pause Menu Logic with Enhanced Input in UE5
+description: Implementing a robust pause menu system using Enhanced Input Actions, Input Mapping Context (IMC) swapping for focus management, and Game/UI input mode switching.
+tags: [unreal-engine, blueprints, ui, enhanced-input, game-design]
+readTime: 8
+date: 2026-05-01
+---
+
+## Preview
+
+This implementation focuses on a clean toggle system that manages more than just visibility. It handles cursor state, focus management, and swaps **Input Mapping Contexts** to ensure gameplay inputs (like looking or shooting) don't interfere with menu navigation.
+
+## Enhanced Input Setup
+
+Before logic can be written, we define the "Toggle" action and its mapping. Unlike legacy input, this allows us to consume or prioritize the pause command even when other inputs are active.
+
+### Input Action (IA_TogglePauseMenu)
+
+The Input Action is a simple `Digital (bool)` trigger.
+
+<Screenshot src="/unreal-engine/iapause.png" alt="Input Action Details"
+            caption="IA_TogglePauseMenu details set to 'Pressed' trigger."/>
+
+### Input Mapping Context (IMC_TogglePauseMenu)
+
+The action is mapped to the **Tab** key (or your preferred key) within the mapping context.
+
+<Screenshot src="/unreal-engine/imcpause.png" alt="IMC Mapping"
+            caption="Mapping IA_TogglePauseMenu to the Tab key."/>
+
+## Initialization
+
+We initialize the widget and its specific mapping context on `BeginPlay` (or equivalent initialization event) in player controller. This ensures the widget exists in memory before we try to toggle it, preventing frame-one lag when opening the menu.
+
+<Screenshot src="/unreal-engine/pause_menu_widget.png" alt="Widget Creation Logic"
+            caption="Creating the WBP_PauseMenu and adding the specific Mapping Context."/>
+
+1. **Create WBP_Pause_Menu_Widget**: Instantiate the UI class.
+2. **Variable Cache**: Store the reference in a variable named `PauseMenuWidget`.
+3. **Add Mapping Context**: We add `IMC_TogglePause` to the **Enhanced Input Local Player Subsystem** so the engine knows to listen for the toggle key immediately.
+
+## Toggle Logic Flow
+
+The core logic uses a **Branch** node driven by a boolean variable `bIsMenuOpen`. This creates a flip-flop effect for opening and closing.
+
+<Screenshot src="/unreal-engine/pause_branch.png" alt="Toggle Branch Logic"
+            caption="Main logic branch for adding/removing the widget from the viewport."/>
+
+### Opening the Menu (False Path)
+If `bIsMenuOpen` is false:
+- **Add to Viewport**: Renders the `PauseMenuWidget`.
+- **Remove Mapping Context**: We remove `IMC_Default` (gameplay inputs like movement) to prevent the character from running while the menu is open.
+- **Input Mode**: Set to **Game and UI**.
+
+### Closing the Menu (True Path)
+If `bIsMenuOpen` is true:
+- **Remove from Parent**: Clears the widget from the screen.
+- **Add Mapping Context**: Re-injects `IMC_Default` so player control resumes.
+- **Input Mode**: Set back to **Game Only**.
+
+## Input Mode and Cursor Management
+
+To provide a seamless transition, we must explicitly tell the Player Controller how to handle the mouse and what the viewport should focus on.
+
+<Screenshot src="/unreal-engine/pause_input.png" alt="Input Mode Management"
+            caption="Handling mouse cursor visibility and Input Mode switching."/>
+
+| State | Input Mode | Mouse Cursor | Mapping Context |
+| :--- | :--- | :--- | :--- |
+| **Paused** | Game and UI | Show (True) | Remove `IMC_MouseLook` |
+| **Unpaused** | Game Only | Hide (False) | Add `IMC_MouseLook` |
+
+<Callout type="tip">
+    Setting the **In Widget to Focus** pin in the `Set Input Mode Game and UI` node to your Pause Menu widget is crucial for gamepad support. This ensures the UI captures navigation inputs immediately.
+</Callout>
+
+## Variable Storage
+
+To keep the Blueprint clean, we track the widget reference and the toggle state as private variables.
+
+<Screenshot src="/unreal-engine/pause_var.png" alt="Variable List"
+            caption="Variables used: PauseMenuWidget (Reference) and bIsMenuOpen (Boolean)."/>
+
+## Common Pitfalls
+
+- **Input Consumption**: If your Pause menu doesn't open while you are moving, ensure the `IA_TogglePauseMenu` has a higher priority or that other actions aren't "consuming" the input.
+- **Focus Issues**: If the mouse appears but you can't click buttons, double-check that `Set Input Mode Game and UI` is targeting the `Self` (Player Controller).
+- **Z-Order**: If the pause menu appears behind other UI elements (like a HUD), set the **ZOrder** in the `Add to Viewport` node to a higher value (e.g., 10).

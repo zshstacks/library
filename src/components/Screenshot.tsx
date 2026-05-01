@@ -7,7 +7,7 @@ interface ScreenshotProps {
 export function Screenshot({ src, alt, caption }: ScreenshotProps) {
   return (
     <figure className="my-6">
-      <div className="overflow-hidden rounded-lg border border-white/8 dark:border-gray-800/12">
+      <div className="overflow-hidden rounded-lg border border-white/8 dark:border-gray-800/12 hover:scale-115 transition-all duration-200">
         <img src={src} alt={alt} className="w-full h-auto block" />
       </div>
       {caption && (
