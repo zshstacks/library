@@ -1,0 +1,544 @@
+---
+title: Live BTC Order Book Sync via Binance WebSocket | Backend ready
+description: Maintaining a real-time BTC order book in Go — REST snapshot + WebSocket diff stream synchronization, gap detection via the `pu` field, map-based O(1) price level storage, and a hub that broadcasts sorted snapshots to WebSocket clients.
+tags: [golang, websocket, binance, orderbook, concurrency]
+readTime: 14
+date: 2025-05-25
+---
+
+## Preview
+
+<Screenshot src="/golang/orderbook_new.png"  alt="Pomodoro timer preview"
+caption="Backend ready BTC orderbook"/>
+
+## Project layout
+
+```
+backend/
+├── cmd/
+│   └── main.go
+└── internal/
+    ├── binance/
+    │   └── orderbook.go       ← raw Binance WS stream
+    ├── orderbook/
+    │   └── manager.go         ← snapshot sync + diff application
+    └── ws/
+        ├── handler.go         ← HTTP → WebSocket upgrade
+        └── hub.go             ← client registry + broadcast
+```
+
+Four responsibilities, four files. `binance/` only knows how to read Binance's
+wire format. `orderbook/` owns the order book state machine. `ws/` only knows
+how to fan messages out to connected browser clients. `main.go` wires them
+together with channels.
+
+## The synchronization problem
+
+Binance's futures depth stream sends **diffs**, not full snapshots — each
+message is a delta of price levels that changed. To have a correct order book,
+you need:
+
+1. A REST **snapshot** — the full order book at a point in time, tagged with `lastUpdateId`
+2. The **WebSocket diff stream** — a continuous feed of changes
+
+The tricky part is aligning them. If you fetch the snapshot before you have
+a live stream connection, you might miss updates that happened in between. If
+you apply diffs before you have a valid snapshot, you're updating nothing.
+Binance's documented algorithm for futures markets:
+
+1. Open the WebSocket stream **first**
+2. Buffer/consume messages while fetching the REST snapshot
+3. Discard any message where `u` (final update ID) is less than `snapshot.lastUpdateId + 1` — too old
+4. Find the first message where `U <= snapshot.lastUpdateId + 1 <= u` — this is the sync point
+5. From then on, verify `pu` (previous final update ID) of each new message
+   equals the `lastUpdateId` you're tracking — if it doesn't match, there's a
+   gap and you must resync from a fresh snapshot
+
+<Callout type="warning">
+    Skipping the `pu` continuity check is the most common order book bug.
+    Without it, a dropped WebSocket message silently corrupts the book —
+    price levels stop updating correctly but nothing crashes. Always verify
+    continuity on every message once synced.
+</Callout>
+
+## Binance WebSocket connection
+
+```go
+type DepthUpdateMessage struct {
+    Data struct {
+        EventType             string      `json:"e"`
+        EventTime             int64       `json:"E"`
+        TransactionTime       int64       `json:"T"`
+        Symbol                string      `json:"s"`
+        FirstUpdate           int64       `json:"U"`
+        FinalUpdate           int64       `json:"u"`
+        FinalUpdateLastStream int64       `json:"pu"`
+        Bids                  [][2]string `json:"b"`
+        Asks                  [][2]string `json:"a"`
+    } `json:"data"`
+}
+
+func OrderbookBTC(ctx context.Context) <-chan DepthUpdateMessage {
+    ch := make(chan DepthUpdateMessage, 100)
+    u := url.URL{
+        Scheme:   "wss",
+        Host:     "fstream.binance.com",
+        Path:     "/stream",
+        RawQuery: "streams=btcusdt@depth@100ms",
+    }
+
+    go func() {
+        c, _, err := websocket.Dial(ctx, u.String(), nil)
+        if err != nil {
+            log.Printf("dial: %v", err)
+            return
+        }
+        c.SetReadLimit(512 * 1024)
+        defer c.Close(websocket.StatusNormalClosure, "")
+
+        for {
+            btc := &DepthUpdateMessage{}
+            err := wsjson.Read(ctx, c, btc)
+            if err != nil {
+                log.Printf("json read: %v", err)
+                break
+            }
+            select {
+            case ch <- *btc:
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+
+    return ch
+}
+```
+
+This is a thin translation layer: connect to Binance's combined stream
+endpoint (`/stream?streams=btcusdt@depth@100ms`), decode each frame into
+`DepthUpdateMessage`, and push it onto a buffered channel. It knows nothing
+about order book state — that's the caller's job.
+
+`SetReadLimit(512 * 1024)` raises the default frame size limit; depth updates
+during volatile periods can carry hundreds of price levels and exceed the
+library's default 32KB limit.
+
+The channel has a `100`-message buffer so a momentary slowdown in the consumer
+doesn't immediately block the read loop. If the consumer falls behind by more
+than 100 messages, the `ch <- *btc` send blocks — at that point the `ctx.Done()`
+branch is the only way out, and messages queue up in the OS socket buffer.
+
+<Callout type="tip">
+    The `data` wrapper in `DepthUpdateMessage` exists because Binance's
+    combined stream format wraps every message as `{"stream": "...", "data": {...}}`.
+    Subscribing to a single raw stream (`/ws/btcusdt@depth`) instead of the
+    combined endpoint (`/stream?streams=...`) would drop that wrapper — but
+    the combined endpoint is used here because it supports subscribing to
+    multiple symbols over one connection later.
+</Callout>
+
+## Order book state — manager.go
+
+### Storage: map instead of sorted slice
+
+```go
+type OrderBookSnapshot struct {
+    LastUpdateID int64               `json:"lastUpdateId"`
+    Bids         map[float64]float64 `json:"bids"` //O(1)
+    Asks         map[float64]float64 `json:"asks"`
+}
+```
+
+Price levels are stored as `map[float64]float64` (price → quantity) rather
+than a sorted slice. Applying a diff update is `O(1)` — look up the price,
+overwrite or delete the quantity. A sorted slice would need binary search plus
+a shift on insert/delete, which gets expensive with hundreds of updates per
+second.
+
+The tradeoff: the map has no order. Sorting only happens once, right before
+a snapshot is sent to WebSocket clients — not on every individual update.
+
+### Fetching the initial snapshot
+
+```go
+func fetchSnapshot(ctx context.Context) (*OrderBookSnapshot, error) {
+    snapshotURL := "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=100"
+
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, snapshotURL, nil)
+    // ...
+    resp, err := http.DefaultClient.Do(req)
+    // ...
+    body, err := io.ReadAll(resp.Body)
+    // ...
+
+    var rawSnapshot rawSnapshot
+    var snapshot OrderBookSnapshot
+    json.Unmarshal(body, &rawSnapshot)
+
+    snapshot.LastUpdateID = rawSnapshot.LastUpdateID
+    snapshot.Bids = make(map[float64]float64)
+    snapshot.Asks = make(map[float64]float64)
+
+    for _, upd := range rawSnapshot.Bids {
+        price, _ := strconv.ParseFloat(upd[0], 64)
+        qty, _ := strconv.ParseFloat(upd[1], 64)
+        if qty == 0 {
+            delete(snapshot.Bids, price)
+        } else {
+            snapshot.Bids[price] = qty
+        }
+    }
+    // same for Asks
+    return &snapshot, nil
+}
+```
+
+The REST response arrives as `[][]string` — pairs of `["price", "quantity"]`
+as strings, since JSON numbers lose precision for financial data. Each pair
+is parsed into `float64` and loaded into the map. `limit=100` caps the
+snapshot to the top 100 levels per side — enough depth for a UI chart without
+pulling the entire book.
+
+<Callout type="note">
+    The `qty == 0` check inside `fetchSnapshot` is dead code — a fresh
+    snapshot from Binance never contains a zero-quantity level; zero quantity
+    is only meaningful in the diff stream as a removal signal. It's harmless
+    here (the `delete` on an empty map is a no-op) but the branch only does
+    real work in `ManageOrderBookBTC`, when applying live diffs.
+</Callout>
+
+### The sync + apply loop
+
+```go
+func ManageOrderBookBTC(ctx context.Context) <-chan SortedOrderBookSnapshot {
+    ch := make(chan SortedOrderBookSnapshot)
+
+    go func() {
+        orderbookBTC := binance.OrderbookBTC(ctx)
+
+        snapshot, err := fetchSnapshot(ctx)
+        if err != nil {
+            return
+        }
+
+        synced := false
+
+    outer:
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case msg := <-orderbookBTC:
+                if !synced {
+                    if msg.Data.FirstUpdate <= snapshot.LastUpdateID+1 && msg.Data.FinalUpdate >= snapshot.LastUpdateID+1 {
+                        synced = true
+                    } else if msg.Data.FinalUpdate < snapshot.LastUpdateID+1 {
+                        continue
+                    } else if msg.Data.FirstUpdate > snapshot.LastUpdateID+1 {
+                        result, err := fetchSnapshot(ctx)
+                        if err != nil {
+                            log.Println(err)
+                            return
+                        }
+                        snapshot = result
+                        continue
+                    }
+                } else {
+                    if msg.Data.FinalUpdateLastStream != snapshot.LastUpdateID {
+                        log.Printf("gap detected: pu=%d snapshot=%d", msg.Data.FinalUpdateLastStream, snapshot.LastUpdateID)
+                        synced = false
+                        result, err := fetchSnapshot(ctx)
+                        if err != nil {
+                            log.Println(err)
+                            return
+                        }
+                        snapshot = result
+                        continue outer
+                    }
+                }
+
+                // apply bid/ask updates
+                for _, upd := range msg.Data.Bids {
+                    price, _ := strconv.ParseFloat(upd[0], 64)
+                    qty, _ := strconv.ParseFloat(upd[1], 64)
+                    if qty == 0 {
+                        delete(snapshot.Bids, price)
+                    } else {
+                        snapshot.Bids[price] = qty
+                    }
+                }
+                for _, upd := range msg.Data.Asks {
+                    price, _ := strconv.ParseFloat(upd[0], 64)
+                    qty, _ := strconv.ParseFloat(upd[1], 64)
+                    if qty == 0 {
+                        delete(snapshot.Asks, price)
+                    } else {
+                        snapshot.Asks[price] = qty
+                    }
+                }
+                snapshot.LastUpdateID = msg.Data.FinalUpdate
+
+                ch <- SortedOrderBookSnapshot{
+                    LastUpdateID: snapshot.LastUpdateID,
+                    Bids:         sortBids(snapshot.Bids),
+                    Asks:         sortAsks(snapshot.Asks),
+                }
+            }
+        }
+    }()
+
+    return ch
+}
+```
+
+Three states drive this loop:
+
+**Not yet synced, message too old** (`FinalUpdate < snapshot.LastUpdateID+1`):
+the diff entirely predates the snapshot — skip it, `continue` to the next message.
+
+**Not yet synced, message too new** (`FirstUpdate > snapshot.LastUpdateID+1`):
+there's a gap between the snapshot and this diff — the snapshot is stale,
+so re-fetch it and try again with the same message stream.
+
+**Not yet synced, message overlaps correctly**
+(`FirstUpdate <= snapshot.LastUpdateID+1 <= FinalUpdate`): this is the
+anchor message. Mark `synced = true` and fall through to apply it.
+
+**Already synced**: every subsequent message's `pu` (`FinalUpdateLastStream`)
+must equal the previous message's `u` (which was stored as `snapshot.LastUpdateID`).
+If they don't match, a message was dropped somewhere — the local book state
+is now unreliable. The fix is to flip `synced = false`, discard the current
+snapshot, fetch a new one, and restart the anchor search via `continue outer`.
+
+<Callout type="tip">
+    The `continue outer` (labeled loop) is necessary here specifically because
+    this branch is nested two `select`/`switch` levels deep inside the `for`
+    loop. A bare `continue` would only continue the nearest enclosing loop,
+    which in this case is correct too since there's only one `for` — but the
+    label makes the intent explicit: "abandon this message and go back to
+    reading the next one from the top."
+</Callout>
+
+Once a message passes the sync check, its bid/ask updates apply the same
+zero-quantity-means-delete rule as the initial snapshot parse, and
+`snapshot.LastUpdateID` advances to the message's `FinalUpdate`. The freshly
+updated book is then sorted and pushed onto the output channel.
+
+### Sorting for output
+
+```go
+func sortBids(bids map[float64]float64) [][]string {
+    keys := make([]float64, 0, len(bids))
+    for k := range bids {
+        keys = append(keys, k)
+    }
+    sort.Slice(keys, func(i, j int) bool {
+        return keys[i] > keys[j]
+    })
+    result := make([][]string, 0, len(keys))
+    for _, k := range keys {
+        result = append(result, []string{
+            strconv.FormatFloat(k, 'f', -1, 64),
+            strconv.FormatFloat(bids[k], 'f', -1, 64),
+        })
+    }
+    return result
+}
+```
+
+Bids sort **descending** (highest buy price first — the best bid is what a
+seller would get immediately). Asks sort **ascending** (lowest sell price
+first — the best ask is what a buyer would pay immediately). `sortAsks` is
+identical except for the comparison direction.
+
+The output format converts back to `[]string` pairs (`strconv.FormatFloat`
+with precision `-1` uses the shortest representation that round-trips) so the
+frontend receives the same string-based price format Binance itself uses —
+no floating point precision surprises in the JSON payload.
+
+<Callout type="warning">
+    Sorting the entire map on every single incoming message is `O(n log n)`
+    where `n` is the number of price levels (up to a few hundred). At
+    Binance's 100ms update cadence this runs roughly 10 times per second.
+    For BTC/USDT depth this is fine, but if you extend this to dozens of
+    symbols simultaneously, consider throttling the sort+broadcast to a fixed
+    interval (e.g. every 200ms) instead of on every message.
+</Callout>
+
+## WebSocket fan-out — hub.go
+
+```go
+type Hub struct {
+    clients    map[*websocket.Conn]bool
+    register   chan *websocket.Conn
+    unregister chan *websocket.Conn
+    Broadcast  chan []byte
+}
+
+func (h *Hub) Run(ctx context.Context) {
+    for {
+        select {
+        case client := <-h.register:
+            h.clients[client] = true
+        case client := <-h.unregister:
+            if _, ok := h.clients[client]; ok {
+                delete(h.clients, client)
+            }
+        case message := <-h.Broadcast:
+            for client := range h.clients {
+                err := client.Write(ctx, websocket.MessageText, message)
+                if err != nil {
+                    delete(h.clients, client)
+                    client.CloseNow()
+                }
+            }
+        case <-ctx.Done():
+            for client := range h.clients {
+                client.CloseNow()
+            }
+            return
+        }
+    }
+}
+```
+
+Classic hub pattern: a single goroutine owns the `clients` map, so there's no
+mutex needed — all access goes through channels, serialized by the `select`.
+`register`/`unregister` add and remove connections. `Broadcast` fans a message
+out to every connected client with a synchronous write per client.
+
+Note the write failure handling: if `client.Write` errors (client disconnected,
+network issue), the client is removed from the map **and** closed immediately
+inside the same broadcast loop — there's no need to wait for a separate
+unregister signal, since the hub already knows the connection is dead.
+
+<Callout type="note">
+    This hub broadcasts synchronously — a slow client blocks the broadcast
+    loop until its write times out or fails, delaying delivery to every other
+    client. For an order book with sub-second update frequency, a slow client
+    is a real risk. A common improvement is giving each client its own
+    buffered outbound channel and write goroutine, so one slow reader can't
+    stall the rest.
+</Callout>
+
+## HTTP upgrade — handler.go
+
+```go
+func (h *Handler) HandleWS(w http.ResponseWriter, r *http.Request) {
+    c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+        InsecureSkipVerify: true,
+    })
+    if err != nil {
+        log.Printf("Accept ws Error: %v", err)
+        return
+    }
+
+    h.hub.register <- c
+    <-r.Context().Done() // Wait until the client disconnects
+    h.hub.unregister <- c
+}
+```
+
+`websocket.Accept` upgrades the HTTP connection. `InsecureSkipVerify: true`
+disables the origin check — fine for local development, but should be
+replaced with an explicit allowed-origins list before deploying publicly.
+
+The handler goroutine's entire job after registering is to block on
+`r.Context().Done()` — this context is canceled automatically when the
+underlying TCP connection closes. There's no read loop here because this
+client never sends anything; it's a pure broadcast subscriber. Blocking on
+context cancellation is a clean way to detect disconnection without a
+dedicated read goroutine.
+
+## Wiring it together — main.go
+
+```go
+func main() {
+    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+    defer stop()
+
+    hub := ws.NewHub()
+    handler := ws.NewHandler(hub)
+
+    go func() {
+        hub.Run(ctx)
+    }()
+
+    go func() {
+        ch := orderbook.ManageOrderBookBTC(ctx)
+        for {
+            select {
+            case data := <-ch:
+                dataBytes, err := json.Marshal(data)
+                if err != nil {
+                    log.Println(err)
+                }
+                select {
+                case hub.Broadcast <- dataBytes:
+                case <-ctx.Done():
+                    return
+                }
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+
+    http.HandleFunc("/ws", handler.HandleWS)
+
+    server := http.Server{Addr: ":8080", Handler: http.DefaultServeMux}
+
+    go func() {
+        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("listen: %s\n", err)
+        }
+    }()
+
+    <-ctx.Done()
+
+    ctxServer, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    server.Shutdown(ctxServer)
+}
+```
+
+The pipeline: `binance.OrderbookBTC` → `orderbook.ManageOrderBookBTC` →
+`json.Marshal` → `hub.Broadcast` → every connected client. Each stage is a
+channel handoff, and every goroutine selects on `ctx.Done()` so a single
+`Ctrl+C` (caught by `signal.NotifyContext`) unwinds the whole pipeline cleanly.
+
+The nested `select` around `hub.Broadcast <- dataBytes` is worth noting: if
+the hub's `Run` loop is somehow stalled and the `Broadcast` channel fills up,
+this send would block forever without the `case <-ctx.Done(): return` escape
+hatch. That inner select is what makes shutdown reliable even under backpressure.
+
+`server.Shutdown` is given a 5-second grace period to let in-flight HTTP
+requests finish before the process exits — though for a pure WebSocket
+service like this, there typically isn't much in flight beyond the open
+connections themselves, which `hub.Run`'s own `ctx.Done()` branch already
+closes with `CloseNow()`.
+
+## End-to-end data flow
+
+```
+Binance fstream.binance.com
+   │  wss://.../stream?streams=btcusdt@depth@100ms
+   ▼
+binance.OrderbookBTC()          — decode JSON, push DepthUpdateMessage
+   │  channel (buffered, 100)
+   ▼
+orderbook.ManageOrderBookBTC()  — snapshot sync, gap detection, apply diffs
+   │  channel (unbuffered)
+   ▼
+main() goroutine                — json.Marshal
+   │
+   ▼
+hub.Broadcast channel (buffered, 100)
+   │
+   ▼
+hub.Run()                       — single-goroutine fan-out to all clients
+   │
+   ▼
+Browser clients (N connections via /ws)
+```
