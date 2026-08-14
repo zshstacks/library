@@ -2,16 +2,11 @@
 
 import { useState, useMemo } from "react";
 import Link from "next/link";
-import {
-  SiUnrealengine,
-  SiGo,
-  SiDotnet,
-  SiReact,
-  SiTypescript,
-} from "react-icons/si";
+import { SiUnrealengine, SiGo, SiReact, SiTypescript } from "react-icons/si";
 import { MdOutlineNavigateNext, MdSearch } from "react-icons/md";
 import { BsTag } from "react-icons/bs";
 import { Article } from "@/utility/types";
+import { CategoryMeta } from "@/utility/types";
 
 const ICON_MAP: Record<string, React.ReactNode> = {
   SiUnrealengine: <SiUnrealengine size={18} />,
@@ -65,7 +60,7 @@ export default function CategoryClientContent({
   category,
   initialArticles,
 }: {
-  category: any;
+  category: CategoryMeta;
   initialArticles: Article[];
 }) {
   const [searchQuery, setSearchQuery] = useState("");
@@ -136,15 +131,23 @@ export default function CategoryClientContent({
           </div>
 
           <div className="max-h-[550px] overflow-y-auto pr-2 custom-scrollbar">
-            <div className="stagger-list flex flex-col gap-2 pb-4">
-              {filteredArticles.map((article) => (
-                <ArticleRow
-                  key={article.slug}
-                  article={article}
-                  accentColor={category.accentColor}
-                />
-              ))}
-            </div>
+            {filteredArticles.length === 0 ? (
+              <div className="py-16 text-center">
+                <p className="text-[13px] text-white/30 dark:text-gray-800/35">
+                  No notes match &ldquo;{searchQuery}&rdquo;.
+                </p>
+              </div>
+            ) : (
+              <div className="stagger-list flex flex-col gap-2 pb-4">
+                {filteredArticles.map((article) => (
+                  <ArticleRow
+                    key={article.slug}
+                    article={article}
+                    accentColor={category.accentColor}
+                  />
+                ))}
+              </div>
+            )}
           </div>
         </section>
       </div>
