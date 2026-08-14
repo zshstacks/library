@@ -7,25 +7,25 @@ interface CalloutProps {
 
 const CALLOUT_STYLES = {
   tip: {
-    border: "border-[#81e6d9]/30",
-    bg: "bg-[#81e6d9]/6 dark:bg-[#81e6d9]/16",
+    border: "border-[#81e6d9]/30 dark:border-[#2c7a7b]/30",
+    bg: "bg-[#81e6d9]/5 dark:bg-[#2c7a7b]/10",
     icon: "💡",
     label: "Tip",
-    labelColor: "text-[#81e6d9]",
+    labelColor: "text-[#81e6d9] dark:text-[#2c7a7b]",
   },
   warning: {
-    border: "border-amber-400/30",
-    bg: "bg-amber-400/6 dark:bg-amber-600/6",
+    border: "border-[#ff63c3]/30 dark:border-indigo-400/30",
+    bg: "bg-[#ff63c3]/5 dark:bg-indigo-400/10",
     icon: "⚠️",
     label: "Warning",
-    labelColor: "text-amber-400 dark:text-amber-700",
+    labelColor: "text-[#ff63c3] dark:text-indigo-400",
   },
   note: {
-    border: "border-white/15",
-    bg: "bg-white/4 dark:bg-amber-400/6",
+    border: "border-white/15 dark:border-gray-800/20",
+    bg: "bg-white/4 dark:bg-white/10",
     icon: "📌",
     label: "Note",
-    labelColor: "text-white/60 dark:text-[#4b525b]",
+    labelColor: "text-white/60 dark:text-gray-800/70",
   },
 };
 
@@ -39,7 +39,7 @@ export function Callout({ type = "note", children }: CalloutProps) {
         <span>{s.icon}</span>
         <span>{s.label}</span>
       </div>
-      <div className="text-[13.5px] text-white/65 dark:text-gray-700/70 leading-relaxed [&_code]:text-[#81e6d9] dark:[&_code]:text-[#319795] [&_code]:bg-white/8 dark:[&_code]:bg-black/8 [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded [&_code]:font-mono [&_code]:text-[12.5px]">
+      <div className="text-[13.5px] text-white/65 dark:text-gray-700/70 leading-relaxed [&_code]:text-[#81e6d9] dark:[&_code]:text-[#2c7a7b] [&_code]:bg-white/8 dark:[&_code]:bg-black/8 [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded [&_code]:font-mono [&_code]:text-[12.5px]">
         {children}
       </div>
     </div>

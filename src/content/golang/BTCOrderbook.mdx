@@ -8,8 +8,22 @@ date: 2025-05-25
 
 ## Preview
 
-<Screenshot src="/golang/orderbook_new.png"  alt="Pomodoro timer preview"
-caption="Backend ready BTC orderbook"/>
+<Screenshot
+  src="/golang/orderbook_new.png"
+  alt="Pomodoro timer preview"
+  caption="Backend ready BTC orderbook"
+/>
+
+
+
+ {/*<Gallery
+images={[
+{ src: "/golang/orderbook_new.png", alt: "Step 1" },
+{ src: "/golang/orderbook_new.png", alt: "Step 2" },
+{ src: "/golang/orderbook_new.png", alt: "Step 3" },
+]}
+/>*/}
+
 
 ## Project layout
 
@@ -55,10 +69,10 @@ Binance's documented algorithm for futures markets:
    gap and you must resync from a fresh snapshot
 
 <Callout type="warning">
-    Skipping the `pu` continuity check is the most common order book bug.
-    Without it, a dropped WebSocket message silently corrupts the book —
-    price levels stop updating correctly but nothing crashes. Always verify
-    continuity on every message once synced.
+  Skipping the `pu` continuity check is the most common order book bug. Without
+  it, a dropped WebSocket message silently corrupts the book — price levels stop
+  updating correctly but nothing crashes. Always verify continuity on every
+  message once synced.
 </Callout>
 
 ## Binance WebSocket connection
@@ -201,11 +215,11 @@ snapshot to the top 100 levels per side — enough depth for a UI chart without
 pulling the entire book.
 
 <Callout type="note">
-    The `qty == 0` check inside `fetchSnapshot` is dead code — a fresh
-    snapshot from Binance never contains a zero-quantity level; zero quantity
-    is only meaningful in the diff stream as a removal signal. It's harmless
-    here (the `delete` on an empty map is a no-op) but the branch only does
-    real work in `ManageOrderBookBTC`, when applying live diffs.
+  The `qty == 0` check inside `fetchSnapshot` is dead code — a fresh snapshot
+  from Binance never contains a zero-quantity level; zero quantity is only
+  meaningful in the diff stream as a removal signal. It's harmless here (the
+  `delete` on an empty map is a no-op) but the branch only does real work in
+  `ManageOrderBookBTC`, when applying live diffs.
 </Callout>
 
 ### The sync + apply loop
@@ -312,12 +326,12 @@ is now unreliable. The fix is to flip `synced = false`, discard the current
 snapshot, fetch a new one, and restart the anchor search via `continue outer`.
 
 <Callout type="tip">
-    The `continue outer` (labeled loop) is necessary here specifically because
-    this branch is nested two `select`/`switch` levels deep inside the `for`
-    loop. A bare `continue` would only continue the nearest enclosing loop,
-    which in this case is correct too since there's only one `for` — but the
-    label makes the intent explicit: "abandon this message and go back to
-    reading the next one from the top."
+  The `continue outer` (labeled loop) is necessary here specifically because
+  this branch is nested two `select`/`switch` levels deep inside the `for` loop.
+  A bare `continue` would only continue the nearest enclosing loop, which in
+  this case is correct too since there's only one `for` — but the label makes
+  the intent explicit: "abandon this message and go back to reading the next one
+  from the top."
 </Callout>
 
 Once a message passes the sync check, its bid/ask updates apply the same
@@ -358,12 +372,12 @@ frontend receives the same string-based price format Binance itself uses —
 no floating point precision surprises in the JSON payload.
 
 <Callout type="warning">
-    Sorting the entire map on every single incoming message is `O(n log n)`
-    where `n` is the number of price levels (up to a few hundred). At
-    Binance's 100ms update cadence this runs roughly 10 times per second.
-    For BTC/USDT depth this is fine, but if you extend this to dozens of
-    symbols simultaneously, consider throttling the sort+broadcast to a fixed
-    interval (e.g. every 200ms) instead of on every message.
+  Sorting the entire map on every single incoming message is `O(n log n)` where
+  `n` is the number of price levels (up to a few hundred). At Binance's 100ms
+  update cadence this runs roughly 10 times per second. For BTC/USDT depth this
+  is fine, but if you extend this to dozens of symbols simultaneously, consider
+  throttling the sort+broadcast to a fixed interval (e.g. every 200ms) instead
+  of on every message.
 </Callout>
 
 ## WebSocket fan-out — hub.go
@@ -414,12 +428,11 @@ inside the same broadcast loop — there's no need to wait for a separate
 unregister signal, since the hub already knows the connection is dead.
 
 <Callout type="note">
-    This hub broadcasts synchronously — a slow client blocks the broadcast
-    loop until its write times out or fails, delaying delivery to every other
-    client. For an order book with sub-second update frequency, a slow client
-    is a real risk. A common improvement is giving each client its own
-    buffered outbound channel and write goroutine, so one slow reader can't
-    stall the rest.
+  This hub broadcasts synchronously — a slow client blocks the broadcast loop
+  until its write times out or fails, delaying delivery to every other client.
+  For an order book with sub-second update frequency, a slow client is a real
+  risk. A common improvement is giving each client its own buffered outbound
+  channel and write goroutine, so one slow reader can't stall the rest.
 </Callout>
 
 ## HTTP upgrade — handler.go

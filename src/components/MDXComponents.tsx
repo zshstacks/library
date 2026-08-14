@@ -3,6 +3,7 @@ import { Callout } from "./Callout";
 import { CopyButton } from "./CopyButton";
 import { YouTube } from "./Youtube";
 import { Screenshot } from "./Screenshot";
+import { Gallery } from "./Gallery";
 
 function slugify(text: string): string {
   return text
@@ -23,6 +24,7 @@ export const MDX_COMPONENTS = {
   Callout,
   YouTube,
   Screenshot,
+  Gallery,
 
   h2: (props: React.HTMLAttributes<HTMLHeadingElement>) => {
     const text = extractText(props.children);
